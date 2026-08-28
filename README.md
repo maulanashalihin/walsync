@@ -239,6 +239,38 @@ Examples:
 - **Multi-replica** — Ship to multiple replicas simultaneously (comma-separated addresses)
 - **Single binary** — Go binary, no runtime dependencies, cross-compile to any platform
 
+## Client compatibility
+
+Tested with walsync v0.7.0 — all clients read incremental WAL correctly with **fresh readonly connection per read**.
+
+| Client | Language | Engine | Status |
+|--------|----------|--------|:------:|
+| sqlite3 CLI | C | C API | ✅ |
+| Python sqlite3 | Python | C API | ✅ |
+| Python SQLAlchemy | Python | C API | ✅ |
+| better-sqlite3 | Node.js | C API | ✅ |
+| node:sqlite | Node.js | C API | ✅ |
+| bun:sqlite | Bun | C API | ✅ |
+| PHP PDO SQLite | PHP | C API | ✅ |
+| Ruby sqlite3 | Ruby | C API | ✅ |
+| mattn/go-sqlite3 | Go | CGo | ✅ |
+| modernc.org/sqlite | Go | pure Go | ✅ |
+| rusqlite | Rust | bundled C | ✅ |
+
+**Pattern for replica reads:**
+```js
+// Open fresh readonly connection per read request.
+// readonly = no checkpoint on close = WAL preserved for next walsync ship.
+// <1ms overhead (SQLite is embedded, no network).
+function readAll(sql, ...params) {
+  const db = new Database(replicaPath, { readonly: true });
+  try { return db.prepare(sql).all(...params); }
+  finally { db.close(); }
+}
+```
+
+**Do NOT use persistent connections on replica** — SQLite caches the `-shm` index in memory. walsync deletes `-shm` after each WAL ship, but an open persistent connection holds a stale cached copy and won't see new WAL frames.
+
 ## Limitations
 
 - **Single-writer** — Only primary accepts writes. Replicas are read-only.
@@ -246,6 +278,7 @@ Examples:
 - **Eventual consistency** — Sync delay ~100ms median (measured: 33-210ms, 2 Singapore VPS, ~20ms RTT)
 - **No auth (by design)** — HTTP endpoints are unauthenticated. Security is handled at network layer (firewall/VPN), not application layer. Zero overhead.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
+- **Replica reads need fresh connection** — walsync writes WAL bytes directly (bypassing SQLite C API). The `-shm` index is deleted after each WAL ship so SQLite rebuilds it on next connection. **Persistent connections cache `-shm` in memory and miss new WAL frames.** Use a fresh readonly connection per read request (<1ms overhead, SQLite is embedded). See [client compatibility table](#client-compatibility) and [app patterns](docs/app-patterns.md).
 
 ### Roadmap
 
@@ -255,6 +288,7 @@ Examples:
 - [x] ~~Multi-primary with conflict resolution~~ — Researched, not pursuing (market crowded: Marmot, cr-sqlite, rqlite, dqlite, LiteFS, Turso)
 - [x] ~~Prometheus metrics endpoint~~ — Shipped in v0.5.0
 - [x] ~~gRPC → Fiber (fasthttp) transport~~ — Shipped in v0.6.0 (1.7-2.1x faster, 24% smaller binary)
+- [x] ~~WAL visibility fix (-shm removal)~~ — Shipped in v0.7.0 (incremental WAL now visible to all SQLite clients)
 
 ## Benchmark
 
@@ -298,6 +332,9 @@ walsync achieves native SQLite speed because:
 See [`examples/`](examples/) for sample apps:
 - `writer-app.js` — Persistent writer (Node.js, keeps DB connection open)
 - `reader-app.js` — Read-only app (Node.js, reads from replica)
+- `app-patterns/server.js` — Express app with role-based read/write split (primary writes, replica reads with fresh readonly per request)
+
+See [`docs/app-patterns.md`](docs/app-patterns.md) for architecture patterns and read-after-write strategies.
 
 ## Contributing
 

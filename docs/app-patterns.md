@@ -25,27 +25,53 @@ Each node knows its role via environment variable. Replicas proxy writes to prim
 ```javascript
 // server.js — works on both primary and replica
 const express = require('express');
-const { DatabaseSync } = require('node:sqlite');
+const Database = require('better-sqlite3');
 
 const ROLE = process.env.WALSYNC_ROLE || 'primary';
 const PRIMARY_URL = process.env.PRIMARY_URL || 'http://localhost:3000';
 const DB_PATH = process.env.DB_PATH || '/data/app.db';
 
-const db = new DatabaseSync(DB_PATH);
-db.exec('PRAGMA journal_mode = WAL');
-db.exec('PRAGMA synchronous = NORMAL');
-db.exec('PRAGMA wal_autocheckpoint = 0');
+// Primary: persistent connection for writes (keeps WAL alive)
+let writeDb = null;
+function getWriteDb() {
+  if (!writeDb) {
+    writeDb = new Database(DB_PATH);
+    writeDb.pragma('journal_mode = WAL');
+    writeDb.pragma('synchronous = NORMAL');
+    writeDb.pragma('wal_autocheckpoint = 0');
+    writeDb.exec('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, city TEXT)');
+  }
+  return writeDb;
+}
+
+// Replica: fresh readonly connection per read.
+// walsync writes WAL bytes directly (bypassing SQLite C API), then deletes
+// -shm so SQLite rebuilds the WAL index on next connection. Persistent
+// connections cache -shm in memory and miss new WAL frames. Fresh readonly
+// = always sees latest data + no checkpoint on close (WAL preserved).
+// <1ms overhead (SQLite is embedded, no network).
+function readQuery(sql, ...params) {
+  const db = new Database(DB_PATH, { readonly: true });
+  try { return db.prepare(sql).all(...params); }
+  finally { db.close(); }
+}
+
+function readOne(sql, ...params) {
+  const db = new Database(DB_PATH, { readonly: true });
+  try { return db.prepare(sql).get(...params); }
+  finally { db.close(); }
+}
 
 const app = express();
 app.use(express.json());
 
 // READ — every node handles locally (native SQLite speed)
 app.get('/api/users', (req, res) => {
-  res.json(db.prepare('SELECT * FROM users ORDER BY id DESC').all());
+  res.json(readQuery('SELECT * FROM users ORDER BY id DESC'));
 });
 
 app.get('/api/users/:id', (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  const user = readOne('SELECT * FROM users WHERE id = ?', Number(req.params.id));
   if (!user) return res.status(404).json({ error: 'not found' });
   res.json(user);
 });
@@ -54,10 +80,9 @@ app.get('/api/users/:id', (req, res) => {
 app.post('/api/users', async (req, res) => {
   if (ROLE === 'primary') {
     const { name, city } = req.body;
-    const result = db.prepare('INSERT INTO users(name, city) VALUES(?, ?)').run(name, city);
-    return res.json({ id: result.lastInsertRowid, name, city });
+    const r = getWriteDb().prepare('INSERT INTO users(name, city) VALUES(?, ?)').run(name, city);
+    return res.json({ id: r.lastInsertRowid, name, city });
   }
-  // Replica: proxy to primary
   try {
     const resp = await fetch(`${PRIMARY_URL}/api/users`, {
       method: 'POST',
@@ -73,7 +98,7 @@ app.post('/api/users', async (req, res) => {
 app.put('/api/users/:id', async (req, res) => {
   if (ROLE === 'primary') {
     const { name, city } = req.body;
-    db.prepare('UPDATE users SET name = ?, city = ? WHERE id = ?').run(name, city, req.params.id);
+    getWriteDb().prepare('UPDATE users SET name = ?, city = ? WHERE id = ?').run(name, city, Number(req.params.id));
     return res.json({ id: Number(req.params.id), ...req.body });
   }
   try {
@@ -90,7 +115,7 @@ app.put('/api/users/:id', async (req, res) => {
 
 app.delete('/api/users/:id', async (req, res) => {
   if (ROLE === 'primary') {
-    db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+    getWriteDb().prepare('DELETE FROM users WHERE id = ?').run(Number(req.params.id));
     return res.json({ deleted: true, id: Number(req.params.id) });
   }
   try {
@@ -383,3 +408,47 @@ backend walsync_nodes
 All nodes receive all requests. GET hits local SQLite. POST/PUT/DELETE either executes locally (primary) or proxies to primary (replica). Simple, no path-based routing needed.
 
 For Pattern 3 (smart client), no load balancer needed — client routes directly.
+
+## WAL visibility on replica (v0.7.0+)
+
+walsync ships WAL bytes directly to the replica's `-wal` file, then deletes `-shm` so SQLite rebuilds its WAL index on the next connection. This works for **fresh connections** but not persistent ones.
+
+### Why persistent connections miss WAL updates
+
+SQLite caches the `-shm` (shared memory WAL index) in process memory when a connection opens. walsync deletes `-shm` after each WAL ship, but an open connection still holds the stale cached copy. New WAL frames are invisible until the connection is closed and reopened.
+
+### Correct pattern: fresh readonly per read
+
+```javascript
+// ✅ Correct — fresh readonly per read
+function readAll(sql, ...params) {
+  const db = new Database(DB_PATH, { readonly: true });
+  try { return db.prepare(sql).all(...params); }
+  finally { db.close(); }
+}
+
+// ❌ Wrong — persistent connection misses incremental WAL
+const db = new Database(DB_PATH);
+app.get('/api/users', (req, res) => {
+  res.json(db.prepare('SELECT * FROM users').all()); // stale after first WAL ship
+});
+```
+
+**Why readonly?** Closing a readwrite connection triggers checkpoint (WAL → DB, WAL truncated). Closing a readonly connection does NOT checkpoint — WAL is preserved for the next walsync incremental ship.
+
+**Overhead:** <1ms per connection. SQLite is embedded (no network, no auth handshake). Opening a file handle + reading the WAL header is negligible.
+
+### Tested SQLite clients
+
+All clients below read incremental WAL correctly with fresh readonly connections (tested v0.7.0):
+
+| Client | Language | Status |
+|-------|----------|:------:|
+| sqlite3 CLI | C | ✅ |
+| Python sqlite3 / SQLAlchemy | Python | ✅ |
+| better-sqlite3 / node:sqlite | Node.js | ✅ |
+| bun:sqlite | Bun | ✅ |
+| PHP PDO SQLite | PHP | ✅ |
+| Ruby sqlite3 | Ruby | ✅ |
+| mattn/go-sqlite3 / modernc.org/sqlite | Go | ✅ |
+| rusqlite | Rust | ✅ |

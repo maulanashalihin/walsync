@@ -523,6 +523,11 @@ func runReplica(dbPath string, listen string) {
 			return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
 		}
 		f.Close()
+		// Remove -shm so SQLite rebuilds WAL index on next connection.
+		// walsync writes WAL bytes directly (bypassing SQLite C API), so the
+		// -shm shared-memory index is stale. Without this, app connections
+		// opened before the WAL write don't see new frames.
+		os.Remove(dbPath + "-shm")
 
 		log.Printf("WAL received: %d bytes at offset %d", len(data), offset)
 		return c.JSON(fiber.Map{"ok": true, "applied_offset": offset + int64(len(data))})

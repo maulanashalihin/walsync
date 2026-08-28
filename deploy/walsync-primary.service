@@ -1,0 +1,36 @@
+# walsync primary — ships WAL to replicas
+# Usage:
+#   1. Copy walsync binary to /usr/local/bin/walsync
+#   2. Copy this file to /etc/systemd/system/walsync-primary.service
+#   3. Edit -db path and -replicas URLs below
+#   4. systemctl daemon-reload
+#   5. systemctl enable --now walsync-primary
+
+[Unit]
+Description=walsync primary (SQLite WAL shipping)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/walsync \
+  -mode primary \
+  -db /var/lib/walsync/app.db \
+  -replicas http://replica1.example.com:9090,http://replica2.example.com:9090
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/walsync
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=walsync-primary
+
+[Install]
+WantedBy=multi-user.target

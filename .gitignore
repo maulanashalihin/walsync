@@ -1,7 +1,8 @@
 # Binaries
 walsync
-walsync-linux-amd64
-walsync-*
+walsync-linux-*
+walsync-darwin-*
+walsync-windows-*
 
 # SQLite test files
 *.db

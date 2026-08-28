@@ -68,6 +68,17 @@ go build -o walsync .
 GOOS=linux GOARCH=amd64 go build -o walsync-linux-amd64 .
 ```
 
+### Download pre-built binary
+
+```bash
+# Download from GitHub releases
+curl -L https://github.com/maulanashalihin/walsync/releases/latest/download/walsync-linux-amd64 -o walsync
+chmod +x walsync
+```
+
+Available: `walsync-darwin-arm64`, `walsync-darwin-amd64`, `walsync-linux-amd64`, `walsync-linux-arm64`.
+
+
 ### Run
 
 ```bash
@@ -77,6 +88,26 @@ GOOS=linux GOARCH=amd64 go build -o walsync-linux-amd64 .
 # Primary (Node 1) — start after replica is up
 ./walsync -mode primary -db /path/to/app.db -replicas http://replica-ip:9090
 ```
+
+### Production deployment
+
+For production, use systemd to run walsync as a daemon with auto-restart, logging, and security hardening. See **[deploy/README.md](deploy/README.md)** for complete guide.
+
+Quick setup:
+
+```bash
+# Install binary
+sudo cp walsync-linux-amd64 /usr/local/bin/walsync
+
+# Copy systemd unit (edit paths first!)
+sudo cp deploy/walsync-primary.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now walsync-primary
+
+# View logs
+sudo journalctl -u walsync-primary -f
+```
+
 
 ### App usage
 

@@ -504,6 +504,13 @@ func runReplica(dbPath string, listen string) {
 			return c.JSON(fiber.Map{"ok": true})
 		}
 
+		// Reject WAL if DB file doesn't exist yet — primary must ship
+		// snapshot first. WAL without DB = SQLite corruption.
+		if _, err := os.Stat(dbPath); err != nil {
+			log.Printf("WAL rejected: DB file does not exist, waiting for snapshot")
+			return c.JSON(fiber.Map{"ok": false, "error": "DB file does not exist, send snapshot first"})
+		}
+
 
 		offset, _ := strconv.ParseInt(string(c.Get("X-Walsync-Offset")), 10, 64)
 
@@ -579,12 +586,14 @@ func runReplica(dbPath string, listen string) {
 		return c.JSON(fiber.Map{"ok": true})
 	})
 
-	// GET /health — health check
+// GET /health — health check
 	app.Get("/health", func(c *fiber.Ctx) error {
+		_, dbErr := os.Stat(dbPath)
 		return c.JSON(fiber.Map{
-			"ok":      true,
-			"db_size": fileSize(dbPath),
-			"wal_size": fileSize(walPath),
+			"ok":        true,
+			"db_exists": dbErr == nil,
+			"db_size":   fileSize(dbPath),
+			"wal_size":  fileSize(walPath),
 		})
 	})
 

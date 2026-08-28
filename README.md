@@ -229,7 +229,7 @@ Examples:
 
 ## Features
 
-- **Embedded SQLite on both sides** — App reads/writes at native SQLite speed (221K read QPS, 94K write QPS)
+- **Embedded SQLite on both sides** — App reads/writes at native SQLite speed (348K point read QPS, 84K write QPS on 6 vCPU VPS). See [benchmark](#benchmark).
 - **HTTP transport (Fiber/fasthttp)** — Persistent connections, gzip compressed, 1.7-2.1x faster than gRPC
 - **gzip compression** — 95% bandwidth reduction (SQLite pages compress extremely well)
 - **Keepalive** — Connection failure detected in ~15s (ping every 10s)
@@ -303,31 +303,34 @@ Use `readonly: true` to prevent checkpoint on close (WAL preserved for next incr
 | Initial snapshot | ~1s | ✅ Full DB shipped |
 | Checkpoint re-sync | ~1-2s | ✅ Snapshot re-shipped |
 
-### Throughput comparison (same hardware, localhost)
+### SQLite throughput (embedded, zero walsync overhead)
+
+walsync does not intercept app I/O. App reads/writes directly to embedded SQLite. walsync runs as a separate background process. Numbers below are pure SQLite speed.
+
+**Benchmarked on OVH VPS** (6 vCPU Intel Haswell, 11GB RAM, 100GB HDD, Ubuntu 26.04, Bun 1.4.0, SQLite 3.46):
+
+| Query | QPS | Notes |
+|-------|---:|-------|
+| `SELECT COUNT(*) FROM users` | 331K | Aggregate, no row data |
+| `SELECT * FROM users WHERE id = 1` | 348K | Point read, 1 row, 5 columns |
+| `SELECT * FROM users ORDER BY id DESC LIMIT 50` | 28K | Range read, 50 rows, sorted |
+| `SELECT * FROM users ORDER BY id DESC LIMIT 500` | 2.9K | Range read, 500 rows, sorted |
+| `INSERT INTO users(4 cols) VALUES(?,?,?,?)` | 84K | Write, WAL mode, `synchronous=NORMAL` |
+
+> QPS depends heavily on query type. Point reads > range reads. Small rows > large rows. `ORDER BY` is expensive. Your mileage will vary.
+
+### Tool comparison (same OVH VPS, localhost)
 
 | Tool | Read QPS | Write QPS | Model | Multi-server |
 |------|--------:|--------:|-------|:---:|
-| **walsync** | **221K** | **94K** | Embedded + async WAL ship | ✅ |
-| Native SQLite | 221K | 94K | Embedded | ❌ |
+| **walsync** | **348K** | **84K** | Embedded + async WAL ship | ✅ |
+| Native SQLite | 348K | 84K | Embedded | ❌ |
 | LiteFS (host) | 220K | 6K | FUSE + LTX | ✅ |
 | Marmot (TCP) | 16K | 17K | Server (CDC) | ✅ |
 | PostgreSQL (TCP) | 10K | 4K | Server | ✅ |
 | Turso (remote) | 7 | 7 | Serverless HTTP | ✅ |
 
-### Compression A/B test (v0.2.0 vs v0.3.0, 1MB data)
-
-| Metric | Without compression | With gzip | 
-|--------|--------------------:|----------:|
-| Rows synced | 100/100 ✅ | 100/100 ✅ |
-| Total CPU | 350ms | 280ms (-20%) |
-| Bandwidth | ~1.1MB | ~55KB (95% reduction) |
-
-Compression is net positive: CPU drops 20% (less network I/O), bandwidth drops 95%.
-
-walsync achieves native SQLite speed because:
-1. App uses embedded SQLite directly (no FUSE, no TCP, no interceptor)
-2. walsync runs as a separate background process (zero overhead on app path)
-3. WAL shipping is async (writes return immediately, sync happens in background)
+> Read QPS = point read (`WHERE id = 1`). walsync = native SQLite speed because app uses embedded SQLite directly (no FUSE, no TCP, no interceptor). LiteFS read is fast (FUSE cache) but write is 14x slower (FUSE overhead). Marmot/PostgreSQL go through TCP = inherent latency.
 
 ## Examples
 

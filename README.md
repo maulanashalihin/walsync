@@ -1,6 +1,6 @@
 # walsync
 
-Live SQLite WAL shipping replication. Write to local SQLite at native speed, sync to replica servers automatically via HTTP.
+Live SQLite WAL shipping replication. Write to local SQLite at native speed, sync to replica servers automatically via gRPC.
 
 ## Why?
 
@@ -20,25 +20,9 @@ Every existing SQLite replication tool forces a tradeoff:
 Result: 221K read QPS + 94K write QPS + live multi-server replication
 ```
 
-The tradeoff: eventual consistency (~1-3s sync delay) and single-writer (primary only).
+The tradeoff: eventual consistency (~1-2s sync delay) and single-writer (primary only).
 
 ## How it works
-
-```
-Primary server:
-  App → SQLite (embedded) → WAL file → disk
-                                    ↓
-  walsync (background):           (auto-detect)
-    1. Watch WAL file changes (fsnotify + polling fallback)
-    2. Ship WAL data to replicas via HTTP
-    3. On checkpoint: ship full DB snapshot
-
-Replica server:
-  walsync (background):
-    1. HTTP endpoint: receive WAL + snapshot
-    2. Write to local SQLite DB/WAL files
-    3. App reads from local SQLite (embedded, native speed)
-```
 
 ```
 ┌─────────────────────────────┐       ┌─────────────────────────────┐
@@ -50,120 +34,227 @@ Replica server:
 │    app.db + app.db-wal      │       │    replica.db + .db-wal     │
 │         │                   │       │         ▲                   │
 │    ┌────┴────┐              │       │    ┌────┴────┐              │
-│    │ walsync │ ── HTTP ─────┼───────┼───→│ walsync │              │
+│    │ walsync │ ── gRPC ─────┼───────┼───→│ walsync │              │
 │    │ primary │  WAL ship    │       │    │ replica │              │
 │    └─────────┘              │       │    └─────────┘              │
 └─────────────────────────────┘       └─────────────────────────────┘
 ```
 
+1. App writes to local SQLite (embedded, native speed)
+2. walsync watches WAL file changes (fsnotify + polling)
+3. walsync ships WAL data to replicas via gRPC (persistent HTTP/2, gzip compressed)
+4. Replica receives WAL, writes to local SQLite
+5. App on replica reads from local SQLite (embedded, native speed)
+
 ## Quick start
 
-### Build
+### 1. Download binary
 
 ```bash
-# Native
-go build -o walsync .
-
-# Cross-compile for Linux amd64
-GOOS=linux GOARCH=amd64 go build -o walsync-linux-amd64 .
-```
-
-### Download pre-built binary
-
-```bash
-# Download from GitHub releases
+# Linux x86_64
 curl -L https://github.com/maulanashalihin/walsync/releases/latest/download/walsync-linux-amd64 -o walsync
 chmod +x walsync
+
+# Other platforms: replace walsync-linux-amd64 with:
+#   walsync-darwin-arm64  (macOS Apple Silicon)
+#   walsync-darwin-amd64  (macOS Intel)
+#   walsync-linux-arm64   (Linux ARM64)
 ```
 
-Available: `walsync-darwin-arm64`, `walsync-darwin-amd64`, `walsync-linux-amd64`, `walsync-linux-arm64`.
-
-
-### Run
+Or build from source (requires Go 1.22+):
 
 ```bash
-# Replica (Node 2) — start first
-./walsync -mode replica -db /path/to/replica.db -listen :9090
-
-# Primary (Node 1) — start after replica is up
-./walsync -mode primary -db /path/to/app.db -replicas http://replica-ip:9090
+git clone https://github.com/maulanashalihin/walsync.git
+cd walsync
+go build -o walsync .
 ```
 
-### Production deployment
-
-For production, use systemd to run walsync as a daemon with auto-restart, logging, and security hardening. See **[deploy/README.md](deploy/README.md)** for complete guide.
-
-Quick setup:
+### 2. Start replica (Node 2)
 
 ```bash
-# Install binary
-sudo cp walsync-linux-amd64 /usr/local/bin/walsync
-
-# Copy systemd unit (edit paths first!)
-sudo cp deploy/walsync-primary.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now walsync-primary
-
-# View logs
-sudo journalctl -u walsync-primary -f
+./walsync -mode replica -db /data/app.db -listen :9090
 ```
 
+This starts a gRPC server on port 9090 that receives WAL data from primary.
 
-### App usage
+### 3. Start primary (Node 1)
+
+```bash
+./walsync -mode primary -db /data/app.db -replicas replica-ip:9090
+```
+
+This watches the WAL file and ships changes to the replica. Multiple replicas: `-replicas replica1:9090,replica2:9090`.
+
+### 4. Use SQLite in your app
 
 Your app uses native SQLite with WAL mode. No special drivers, no FUSE, no proxies:
 
 ```javascript
+// Node.js (node:sqlite or better-sqlite3)
 const { DatabaseSync } = require('node:sqlite');
-const db = new DatabaseSync('/path/to/app.db');
+const db = new DatabaseSync('/data/app.db');
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA synchronous = NORMAL');
 db.exec('PRAGMA wal_autocheckpoint = 0'); // let walsync handle checkpointing
+
+// Write on primary
+db.prepare('INSERT INTO users(name, city) VALUES(?, ?)').run('Alice', 'Singapore');
+
+// Read on replica (different server, same native speed)
+const users = db.prepare('SELECT * FROM users').all();
 ```
 
-Works with any SQLite binding in any language: `better-sqlite3` (Node), `sqlite3` (Python), `rusqlite` (Rust), `database/sql` (Go CGo), raw C API.
+```python
+# Python (sqlite3)
+import sqlite3
+db = sqlite3.connect('/data/app.db')
+db.execute('PRAGMA journal_mode = WAL')
+db.execute('PRAGMA synchronous = NORMAL')
+db.execute('PRAGMA wal_autocheckpoint = 0')
+```
+
+```go
+// Go (CGo + mattn/go-sqlite3)
+db, _ := sql.Open("sqlite3", "/data/app.db?_journal_mode=WAL&_synchronous=NORMAL&_wal_autocheckpoint=0")
+```
+
+```rust
+// Rust (rusqlite)
+let conn = Connection::open("/data/app.db")?;
+conn.pragma_update(None, "journal_mode", "WAL")?;
+conn.pragma_update(None, "synchronous", "NORMAL")?;
+conn.pragma_update(None, "wal_autocheckpoint", "0")?;
+```
+
+Works with any SQLite binding in any language. The only requirement: **WAL mode** and **disable auto-checkpoint** so walsync can track changes.
+
+### 5. Verify sync
+
+```bash
+# On primary: write a row
+sqlite3 /data/app.db "INSERT INTO users(name) VALUES('test');"
+
+# On replica: read it (within ~1-2 seconds)
+sqlite3 /data/app.db "SELECT * FROM users;"
+```
+
+## Production deployment
+
+### systemd (recommended)
+
+```bash
+# 1. Install binary
+sudo mkdir -p /var/lib/walsync
+sudo cp walsync-linux-amd64 /usr/local/bin/walsync
+
+# 2. Copy service file (edit -db path and -replicas first!)
+sudo cp deploy/walsync-primary.service /etc/systemd/system/
+# Edit: sudo nano /etc/systemd/system/walsync-primary.service
+
+# 3. Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now walsync-primary
+
+# 4. Check status and logs
+sudo systemctl status walsync-primary
+sudo journalctl -u walsync-primary -f
+```
+
+For replica: copy `deploy/walsync-replica.service` instead.
+
+systemd features included: auto-restart on failure, start on boot, security hardening (NoNewPrivileges, ProtectSystem, PrivateTmp), journal logging.
+
+### Docker
+
+```bash
+# Build
+docker build -t walsync .
+
+# Run replica
+docker run -d --name walsync-replica \
+  -p 9090:9090 \
+  -v /data/walsync:/var/lib/walsync \
+  walsync -mode replica -db /var/lib/walsync/app.db -listen :9090
+
+# Run primary
+docker run -d --name walsync-primary \
+  -v /data/walsync:/var/lib/walsync \
+  walsync -mode primary -db /var/lib/walsync/app.db -replicas replica-host:9090
+```
+
+### Firewall
+
+Replica listens on port 9090 (gRPC). Restrict to primary IPs:
+
+```bash
+# UFW (Ubuntu/Debian)
+sudo ufw allow from PRIMARY_IP to any port 9090
+sudo ufw deny 9090
+```
+
+See [deploy/README.md](deploy/README.md) for complete production guide (operations, log rotation, updates, multi-replica setup).
+
+## CLI reference
+
+```
+walsync -mode <primary|replica> -db <path> [options]
+
+Primary mode:
+  -mode primary
+  -db <path>              SQLite database file path
+  -replicas <addr,addr>   Comma-separated replica addresses (host:port)
+
+Replica mode:
+  -mode replica
+  -db <path>              SQLite database file path
+  -listen <addr>          gRPC listen address (default :9090)
+
+Examples:
+  walsync -mode replica -db /data/app.db -listen :9090
+  walsync -mode primary -db /data/app.db -replicas 10.0.0.2:9090,10.0.0.3:9090
+```
 
 ## Features
 
 - **Embedded SQLite on both sides** — App reads/writes at native SQLite speed (221K read QPS, 94K write QPS)
+- **gRPC transport** — Persistent HTTP/2 connection, no TCP handshake per sync
+- **gzip compression** — 95% bandwidth reduction (SQLite pages compress extremely well)
+- **Keepalive** — Connection failure detected in ~15s (ping every 10s)
 - **Automatic sync** — walsync detects WAL changes and ships to replicas in background
 - **Initial snapshot** — On startup, ships full DB + WAL to new replicas
 - **Checkpoint detection** — When SQLite checkpoints (WAL → DB), ships new snapshot automatically
-- **Multi-replica** — Ship to multiple replicas simultaneously (comma-separated URLs)
+- **Multi-replica** — Ship to multiple replicas simultaneously (comma-separated addresses)
 - **Single binary** — Go binary, no runtime dependencies, cross-compile to any platform
 
 ## Limitations
 
-This is an MVP. Current constraints:
-
 - **Single-writer** — Only primary accepts writes. Replicas are read-only.
 - **No failover** — No automatic primary promotion. Manual failover only.
-- **Eventual consistency** — Sync delay ~1-3 seconds depending on network.
-- **No auth** — HTTP endpoints are unauthenticated. Use behind VPN/firewall.
+- **Eventual consistency** — Sync delay ~1-2 seconds depending on network.
+- **No auth** — gRPC endpoints are unauthenticated. Use behind VPN/firewall.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
 
 ### Roadmap
 
-- [ ] WAL frame-level incremental shipping (avoid full snapshot on checkpoint)
+- [ ] WAL frame-level incremental shipping — avoid full snapshot on checkpoint ([#3](https://github.com/maulanashalihin/walsync/issues/3))
 - [ ] TLS + token authentication
 - [ ] Automatic failover (promote replica on primary failure)
 - [ ] Multi-primary with conflict resolution (LWW or CRDT)
-- [ ] gRPC transport option (lower overhead than HTTP)
 - [ ] Prometheus metrics endpoint
 
 ## Benchmark
 
-Multi-server test: 2 Singapore VPS (~20ms network latency), 6 vCPU x86_64.
+### Sync performance (2 Singapore VPS, ~20ms latency, 6 vCPU x86_64)
 
 | Operation | Sync delay | Result |
 |-----------|-----------:|--------|
-| INSERT | ~3s | ✅ All rows replicated |
-| UPDATE | ~3s | ✅ Updates replicated |
-| DELETE | ~3s | ✅ Deletes replicated |
+| INSERT | ~1-2s | ✅ All rows replicated |
+| UPDATE | ~1-2s | ✅ Updates replicated |
+| DELETE | ~1-2s | ✅ Deletes replicated |
 | Initial snapshot | ~1s | ✅ Full DB shipped |
-| Checkpoint re-sync | ~3s | ✅ Snapshot re-shipped |
+| Checkpoint re-sync | ~1-2s | ✅ Snapshot re-shipped |
 
-Performance comparison (same hardware, localhost):
+### Throughput comparison (same hardware, localhost)
 
 | Tool | Read QPS | Write QPS | Model | Multi-server |
 |------|--------:|--------:|-------|:---:|
@@ -173,6 +264,16 @@ Performance comparison (same hardware, localhost):
 | Marmot (TCP) | 16K | 17K | Server (CDC) | ✅ |
 | PostgreSQL (TCP) | 10K | 4K | Server | ✅ |
 | Turso (remote) | 7 | 7 | Serverless HTTP | ✅ |
+
+### Compression A/B test (v0.2.0 vs v0.3.0, 1MB data)
+
+| Metric | Without compression | With gzip | 
+|--------|--------------------:|----------:|
+| Rows synced | 100/100 ✅ | 100/100 ✅ |
+| Total CPU | 350ms | 280ms (-20%) |
+| Bandwidth | ~1.1MB | ~55KB (95% reduction) |
+
+Compression is net positive: CPU drops 20% (less network I/O), bandwidth drops 95%.
 
 walsync achieves native SQLite speed because:
 1. App uses embedded SQLite directly (no FUSE, no TCP, no interceptor)

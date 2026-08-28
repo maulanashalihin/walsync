@@ -58,6 +58,33 @@ type replicaConn struct {
 	addr string
 	conn *grpc.ClientConn
 	cli  pb.WalSyncClient
+	mu   sync.Mutex
+}
+
+// reconnect closes the old connection and establishes a new one
+func (rc *replicaConn) reconnect() error {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	if rc.conn != nil {
+		rc.conn.Close()
+	}
+
+	conn, err := grpc.NewClient(rc.addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second,
+			Timeout:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)),
+	)
+	if err != nil {
+		return err
+	}
+	rc.conn = conn
+	rc.cli = pb.NewWalSyncClient(conn)
+	return nil
 }
 
 func runPrimary(dbPath string, replicasCSV string) {
@@ -73,24 +100,14 @@ func runPrimary(dbPath string, replicasCSV string) {
 	// Establish persistent gRPC connections to all replicas
 	conns := make([]*replicaConn, 0, len(replicaAddrs))
 	for _, addr := range replicaAddrs {
-		// Ensure addr has port (default 9090)
 		if !hasPort(addr) {
 			addr = addr + ":9090"
 		}
-		conn, err := grpc.NewClient(addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:                10 * time.Second,
-				Timeout:             5 * time.Second,
-				PermitWithoutStream: true,
-			}),
-			grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)),
-		)
-		if err != nil {
+		rc := &replicaConn{addr: addr}
+		if err := rc.reconnect(); err != nil {
 			log.Fatalf("failed to connect to replica %s: %v", addr, err)
 		}
-		cli := pb.NewWalSyncClient(conn)
-		conns = append(conns, &replicaConn{addr: addr, conn: conn, cli: cli})
+		conns = append(conns, rc)
 		log.Printf("connected to replica %s", addr)
 	}
 	defer func() {
@@ -119,6 +136,7 @@ func runPrimary(dbPath string, replicasCSV string) {
 	// Track last shipped WAL size and DB mtime
 	lastShippedSize := fileSize(walPath)
 	lastShippedDBMod := fileModTime(dbPath)
+	lastSalt1, lastSalt2 := walSalt(walPath)
 
 	// Debounce: batch rapid WAL changes
 	debounceMs := 50 * time.Millisecond
@@ -174,6 +192,18 @@ func runPrimary(dbPath string, replicasCSV string) {
 				shipSnapshotGRPC(dbPath, walPath, conns)
 				lastShippedSize = fileSize(walPath)
 				lastShippedDBMod = currentDBMod
+				lastSalt1, lastSalt2 = walSalt(walPath)
+			}
+
+			// Check if WAL salt changed (WAL recreated with different salt)
+			curSalt1, curSalt2 := walSalt(walPath)
+			if curSalt1 != lastSalt1 || curSalt2 != lastSalt2 {
+				if curSalt1 != 0 { // skip if WAL doesn't exist
+					log.Printf("WAL salt changed, shipping snapshot...")
+					shipSnapshotGRPC(dbPath, walPath, conns)
+					lastShippedSize = fileSize(walPath)
+					lastSalt1, lastSalt2 = curSalt1, curSalt2
+				}
 			}
 
 		case <-debounceCh:
@@ -222,16 +252,27 @@ func shipSnapshotGRPC(dbPath, walPath string, conns []*replicaConn) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			ack, err := rc.cli.ShipSnapshot(ctx, snap)
+		ack, err := rc.cli.ShipSnapshot(ctx, snap)
+		if err != nil {
+			log.Printf("error sending snapshot to %s: %v, reconnecting...", rc.addr, err)
+			if rerr := rc.reconnect(); rerr != nil {
+				log.Printf("reconnect to %s failed: %v", rc.addr, rerr)
+				return
+			}
+			// Retry once
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+			ack, err = rc.cli.ShipSnapshot(ctx2, snap)
 			if err != nil {
-				log.Printf("error sending snapshot to %s: %v", rc.addr, err)
+				log.Printf("retry snapshot to %s failed: %v", rc.addr, err)
 				return
 			}
-			if !ack.Ok {
-				log.Printf("snapshot to %s failed: %s", rc.addr, ack.Error)
-				return
-			}
-			log.Printf("snapshot shipped to %s (%d bytes db, %d bytes wal)", rc.addr, len(dbData), len(walData))
+		}
+		if !ack.Ok {
+			log.Printf("snapshot to %s failed: %s", rc.addr, ack.Error)
+			return
+		}
+		log.Printf("snapshot shipped to %s (%d bytes db, %d bytes wal)", rc.addr, len(dbData), len(walData))
 		}(rc)
 	}
 	wg.Wait()
@@ -275,14 +316,25 @@ func shipWALGRPC(walPath string, offset, size int64, conns []*replicaConn) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			ack, err := rc.cli.ShipWal(ctx, chunk)
-			if err != nil {
-				log.Printf("error shipping wal to %s: %v", rc.addr, err)
+		ack, err := rc.cli.ShipWal(ctx, chunk)
+		if err != nil {
+			log.Printf("error shipping wal to %s: %v, reconnecting...", rc.addr, err)
+			if rerr := rc.reconnect(); rerr != nil {
+				log.Printf("reconnect to %s failed: %v", rc.addr, rerr)
 				return
 			}
-			if !ack.Ok {
-				log.Printf("wal ship to %s failed: %s", rc.addr, ack.Error)
+			// Retry once
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel2()
+			ack, err = rc.cli.ShipWal(ctx2, chunk)
+			if err != nil {
+				log.Printf("retry wal ship to %s failed: %v", rc.addr, err)
+				return
 			}
+		}
+		if !ack.Ok {
+			log.Printf("wal ship to %s failed: %s", rc.addr, ack.Error)
+		}
 		}(rc)
 	}
 	wg.Wait()
@@ -440,6 +492,24 @@ func fileModTime(path string) time.Time {
 		return time.Time{}
 	}
 	return info.ModTime()
+}
+
+// walSalt reads the salt values from the WAL header (bytes 16-23).
+// Salt changes when SQLite recreates the WAL file (e.g. after checkpoint).
+// Returns (0, 0) if WAL file doesn't exist.
+func walSalt(walPath string) (uint32, uint32) {
+	f, err := os.Open(walPath)
+	if err != nil {
+		return 0, 0
+	}
+	defer f.Close()
+	header := make([]byte, walHeaderSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return 0, 0
+	}
+	salt1 := binary.BigEndian.Uint32(header[16:])
+	salt2 := binary.BigEndian.Uint32(header[20:])
+	return salt1, salt2
 }
 
 func hasPort(addr string) bool {

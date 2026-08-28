@@ -149,3 +149,82 @@ sudo systemctl stop walsync-primary
 sudo cp walsync-linux-amd64 /usr/local/bin/walsync
 sudo systemctl start walsync-primary
 ```
+
+## Manual failover
+
+When primary goes down, promote a replica manually. No consensus needed — human judgment prevents split-brain.
+
+### Step 1: Confirm primary is down
+
+```bash
+# On primary server
+sudo systemctl status walsync-primary
+# If failed/inactive, check if server itself is reachable
+ssh primary-host "systemctl is-active walsync-primary"
+```
+
+### Step 2: Promote replica to primary
+
+```bash
+# On replica server
+sudo systemctl stop walsync-replica
+
+# Verify replica has latest data
+sqlite3 /var/lib/walsync/app.db "SELECT COUNT(*) FROM your_table;"
+
+# Start as primary (point to other replicas if any)
+sudo walsync -mode primary \
+  -db /var/lib/walsync/app.db \
+  -replicas other-replica:9090
+
+# Or edit systemd service to switch mode:
+# sudo nano /etc/systemd/system/walsync-primary.service
+# Change ExecStart to: /usr/local/bin/walsync -mode primary ...
+# sudo systemctl daemon-reload
+# sudo systemctl enable --now walsync-primary
+```
+
+### Step 3: Update app config
+
+Point your app to the new primary:
+
+```bash
+# Update app config (environment variable, config file, or DNS)
+DB_PRIMARY_HOST=new-primary-ip
+
+# Or update DNS record to point to new primary
+# dig app.example.com → should resolve to new primary IP
+```
+
+### Step 4: Old primary comes back — demote to replica
+
+```bash
+# On old primary server
+sudo systemctl stop walsync-primary
+
+# Discard stale data (it may have writes from before outage)
+sudo rm /var/lib/walsync/app.db /var/lib/walsync/app.db-wal /var/lib/walsync/app.db-shm
+
+# Start as replica — gets fresh snapshot from new primary
+sudo walsync -mode replica \
+  -db /var/lib/walsync/app.db \
+  -listen :9090
+
+# Or switch systemd service:
+# sudo cp deploy/walsync-replica.service /etc/systemd/system/
+# sudo systemctl daemon-reload
+# sudo systemctl enable --now walsync-replica
+```
+
+### Why not automatic?
+
+Automatic failover that's safe requires consensus (Raft/Paxos) to prevent split-brain:
+
+```
+Network partition (not a real crash):
+  Primary A: still alive, still accepting writes
+  Replica B: "primary is down!" → promotes itself
+  → Two primaries, data diverges, corruption on merge
+```
+
+Consensus solves this with quorum voting (majority must agree to promote). But that's what rqlite, dqlite, and LiteFS do — they're consensus-based replication systems. walsync is WAL shipping, not consensus. Manual failover = human is the quorum.

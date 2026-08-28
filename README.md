@@ -242,7 +242,7 @@ Examples:
 ## Limitations
 
 - **Single-writer** — Only primary accepts writes. Replicas are read-only.
-- **No failover** — No automatic primary promotion. Manual failover only.
+- **No automatic failover (by design)** — Manual failover only. Safe automatic failover requires consensus to prevent split-brain. See [manual failover guide](deploy/README.md#manual-failover).
 - **Eventual consistency** — Sync delay ~100ms median (measured: 33-210ms, 2 Singapore VPS, ~20ms RTT)
 - **No auth (by design)** — HTTP endpoints are unauthenticated. Security is handled at network layer (firewall/VPN), not application layer. Zero overhead.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
@@ -251,7 +251,7 @@ Examples:
 
 - [x] ~~WAL frame-level incremental shipping~~ — Not viable (checkpoint modifies untracked pages, causes corruption)
 - [x] ~~TLS + token authentication~~ — Not pursuing. Firewall is zero-overhead, kernel-level. TLS adds handshake + encrypt/decrypt per request. IP verification adds per-connection check. Use firewall/VPN instead.
-- [ ] Automatic failover (promote replica on primary failure)
+- [x] ~~Automatic failover~~ — Not pursuing. Safe failover requires consensus (Raft/Paxos) to prevent split-brain. That's rqlite/dqlite territory. Manual failover guide in [deploy/README.md](deploy/README.md#manual-failover).
 - [x] ~~Multi-primary with conflict resolution~~ — Researched, not pursuing (market crowded: Marmot, cr-sqlite, rqlite, dqlite, LiteFS, Turso)
 - [x] ~~Prometheus metrics endpoint~~ — Shipped in v0.5.0
 - [x] ~~gRPC → Fiber (fasthttp) transport~~ — Shipped in v0.6.0 (1.7-2.1x faster, 24% smaller binary)

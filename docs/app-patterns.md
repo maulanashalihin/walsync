@@ -44,34 +44,28 @@ function getWriteDb() {
   return writeDb;
 }
 
-// Replica: fresh readonly connection per read.
-// walsync writes WAL bytes directly (bypassing SQLite C API), then deletes
-// -shm so SQLite rebuilds the WAL index on next connection. Persistent
-// connections cache -shm in memory and miss new WAL frames. Fresh readonly
-// = always sees latest data + no checkpoint on close (WAL preserved).
-// <1ms overhead (SQLite is embedded, no network).
-function readQuery(sql, ...params) {
-  const db = new Database(DB_PATH, { readonly: true });
-  try { return db.prepare(sql).all(...params); }
-  finally { db.close(); }
-}
-
-function readOne(sql, ...params) {
-  const db = new Database(DB_PATH, { readonly: true });
-  try { return db.prepare(sql).get(...params); }
-  finally { db.close(); }
-}
+// Replica: persistent readonly connection (natural pattern).
+// walsync corrupts -shm after each WAL ship (same inode) → SQLite detects
+// invalid checksum → rebuilds WAL index from scan → updates -shm in place.
+// Persistent connection sees update via mmap shared memory.
+// readonly = no checkpoint on close = WAL preserved for next incremental ship.
+const readDb = ROLE === 'replica' ? new Database(DB_PATH, { readonly: true }) : null;
 
 const app = express();
 app.use(express.json());
 
 // READ — every node handles locally (native SQLite speed)
+// Primary reads from writeDb, replica reads from readDb (persistent readonly)
+function getReadDb() {
+  return ROLE === 'primary' ? getWriteDb() : readDb;
+}
+
 app.get('/api/users', (req, res) => {
-  res.json(readQuery('SELECT * FROM users ORDER BY id DESC'));
+  res.json(getReadDb().prepare('SELECT * FROM users ORDER BY id DESC').all());
 });
 
 app.get('/api/users/:id', (req, res) => {
-  const user = readOne('SELECT * FROM users WHERE id = ?', Number(req.params.id));
+  const user = getReadDb().prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!user) return res.status(404).json({ error: 'not found' });
   res.json(user);
 });
@@ -409,38 +403,43 @@ All nodes receive all requests. GET hits local SQLite. POST/PUT/DELETE either ex
 
 For Pattern 3 (smart client), no load balancer needed — client routes directly.
 
-## WAL visibility on replica (v0.7.0+)
+## WAL visibility on replica (v0.8.0+)
 
-walsync ships WAL bytes directly to the replica's `-wal` file, then deletes `-shm` so SQLite rebuilds its WAL index on the next connection. This works for **fresh connections** but not persistent ones.
+walsync ships WAL bytes directly to the replica's `-wal` file. After each WAL ship, walsync **corrupts** `-shm` (flips first byte, same inode) so SQLite detects an invalid checksum, rebuilds the WAL index from the WAL file, and writes the valid index back to the same file. Persistent app connections see the update via mmap shared memory.
 
-### Why persistent connections miss WAL updates
+### How it works
 
-SQLite caches the `-shm` (shared memory WAL index) in process memory when a connection opens. walsync deletes `-shm` after each WAL ship, but an open connection still holds the stale cached copy. New WAL frames are invisible until the connection is closed and reopened.
+```
+walsync writes WAL bytes → -wal file grows
+walsync corrupts -shm     → first byte flipped (same inode)
+app's persistent conn     → next query reads -shm via mmap
+                           → detects invalid checksum
+                           → scans -wal for all valid frames
+                           → rebuilds -shm in place (same inode)
+                           → sees new WAL frames ✅
+```
 
-### Correct pattern: fresh readonly per read
+### Correct pattern: persistent readonly
 
 ```javascript
-// ✅ Correct — fresh readonly per read
-function readAll(sql, ...params) {
-  const db = new Database(DB_PATH, { readonly: true });
-  try { return db.prepare(sql).all(...params); }
-  finally { db.close(); }
-}
-
-// ❌ Wrong — persistent connection misses incremental WAL
-const db = new Database(DB_PATH);
+// ✅ Natural pattern — persistent readonly connection
+const db = new Database(DB_PATH, { readonly: true });
 app.get('/api/users', (req, res) => {
-  res.json(db.prepare('SELECT * FROM users').all()); // stale after first WAL ship
+  res.json(db.prepare('SELECT * FROM users').all()); // always sees latest WAL
 });
 ```
 
-**Why readonly?** Closing a readwrite connection triggers checkpoint (WAL → DB, WAL truncated). Closing a readonly connection does NOT checkpoint — WAL is preserved for the next walsync incremental ship.
+Use `readonly: true` to prevent checkpoint on close (WAL preserved for next incremental ship).
 
-**Overhead:** <1ms per connection. SQLite is embedded (no network, no auth handshake). Opening a file handle + reading the WAL header is negligible.
+### Why not delete -shm? (v0.7.0 approach)
+
+v0.7.0 deleted `-shm` after each WAL ship. This created a new file (different inode). Persistent connections had the old file mmap'd (still in memory after deletion) and never saw the new `-shm`. Only fresh connections worked — requiring an unnatural "open+close per read" pattern.
+
+v0.8.0 corrupts `-shm` in place (same inode). SQLite rebuilds it, and mmap coherence ensures all connections see the update.
 
 ### Tested SQLite clients
 
-All clients below read incremental WAL correctly with fresh readonly connections (tested v0.7.0):
+All clients below read incremental WAL correctly with persistent readonly connections (tested v0.8.0):
 
 | Client | Language | Status |
 |-------|----------|:------:|

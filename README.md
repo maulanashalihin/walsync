@@ -241,7 +241,7 @@ Examples:
 
 ## Client compatibility
 
-Tested with walsync v0.7.0 — all clients read incremental WAL correctly with **fresh readonly connection per read**.
+Tested with walsync v0.8.0 — all clients read incremental WAL correctly with **persistent readonly connections** (natural app pattern).
 
 | Client | Language | Engine | Status |
 |--------|----------|--------|:------:|
@@ -259,17 +259,17 @@ Tested with walsync v0.7.0 — all clients read incremental WAL correctly with *
 
 **Pattern for replica reads:**
 ```js
-// Open fresh readonly connection per read request.
-// readonly = no checkpoint on close = WAL preserved for next walsync ship.
-// <1ms overhead (SQLite is embedded, no network).
-function readAll(sql, ...params) {
-  const db = new Database(replicaPath, { readonly: true });
-  try { return db.prepare(sql).all(...params); }
-  finally { db.close(); }
-}
+// Natural pattern — persistent readonly connection.
+// walsync corrupts -shm after each WAL ship (same inode).
+// SQLite detects invalid checksum → rebuilds from WAL → updates -shm in place.
+// Persistent connection sees update via mmap shared memory.
+const db = new Database(replicaPath, { readonly: true });
+app.get('/api/users', (req, res) => {
+  res.json(db.prepare('SELECT * FROM users').all());
+});
 ```
 
-**Do NOT use persistent connections on replica** — SQLite caches the `-shm` index in memory. walsync deletes `-shm` after each WAL ship, but an open persistent connection holds a stale cached copy and won't see new WAL frames.
+Use `readonly: true` to prevent checkpoint on close (WAL preserved for next incremental ship).
 
 ## Limitations
 
@@ -278,7 +278,7 @@ function readAll(sql, ...params) {
 - **Eventual consistency** — Sync delay ~100ms median (measured: 33-210ms, 2 Singapore VPS, ~20ms RTT)
 - **No auth (by design)** — HTTP endpoints are unauthenticated. Security is handled at network layer (firewall/VPN), not application layer. Zero overhead.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
-- **Replica reads need fresh connection** — walsync writes WAL bytes directly (bypassing SQLite C API). The `-shm` index is deleted after each WAL ship so SQLite rebuilds it on next connection. **Persistent connections cache `-shm` in memory and miss new WAL frames.** Use a fresh readonly connection per read request (<1ms overhead, SQLite is embedded). See [client compatibility table](#client-compatibility) and [app patterns](docs/app-patterns.md).
+- **Replica reads use readonly connections** — walsync corrupts `-shm` after each WAL ship (same inode) so SQLite rebuilds the WAL index in place. Persistent readonly connections see new frames via mmap. Use `readonly: true` to prevent checkpoint on close (WAL preserved). See [client compatibility](#client-compatibility) and [app patterns](docs/app-patterns.md).
 
 ### Roadmap
 
@@ -289,6 +289,7 @@ function readAll(sql, ...params) {
 - [x] ~~Prometheus metrics endpoint~~ — Shipped in v0.5.0
 - [x] ~~gRPC → Fiber (fasthttp) transport~~ — Shipped in v0.6.0 (1.7-2.1x faster, 24% smaller binary)
 - [x] ~~WAL visibility fix (-shm removal)~~ — Shipped in v0.7.0 (incremental WAL now visible to all SQLite clients)
+- [x] ~~WAL visibility fix (-shm corruption)~~ — Shipped in v0.8.0 (persistent readonly connections now see incremental WAL via mmap)
 
 ## Benchmark
 

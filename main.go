@@ -523,11 +523,12 @@ func runReplica(dbPath string, listen string) {
 			return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
 		}
 		f.Close()
-		// Remove -shm so SQLite rebuilds WAL index on next connection.
-		// walsync writes WAL bytes directly (bypassing SQLite C API), so the
-		// -shm shared-memory index is stale. Without this, app connections
-		// opened before the WAL write don't see new frames.
-		os.Remove(dbPath + "-shm")
+		// Corrupt -shm (flip first byte) so SQLite detects invalid checksum,
+		// rebuilds the WAL index from WAL scan, and updates -shm in place.
+		// Same inode = persistent app connections see the update via mmap.
+		// (Deleting -shm creates a new inode; persistent connections keep
+		// pointing to the old deleted file and stay stale.)
+		invalidateShm(dbPath)
 
 		log.Printf("WAL received: %d bytes at offset %d", len(data), offset)
 		return c.JSON(fiber.Map{"ok": true, "applied_offset": offset + int64(len(data))})
@@ -582,6 +583,22 @@ func runReplica(dbPath string, listen string) {
 	if err := app.Listen(listen); err != nil {
 		log.Fatalf("fiber listen: %v", err)
 	}
+}
+
+// invalidateShm corrupts the -shm file by flipping the first byte.
+// SQLite detects the invalid checksum on next query, rebuilds the WAL
+// index from the WAL file, and writes the valid index back to the same
+// file (same inode). This allows persistent app connections to see new
+// WAL frames via mmap shared memory. If -shm doesn't exist, this is a
+// no-op (fresh connections will rebuild it on open).
+func invalidateShm(dbPath string) {
+	shmPath := dbPath + "-shm"
+	data, err := os.ReadFile(shmPath)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	data[0] ^= 0xFF
+	os.WriteFile(shmPath, data, 0644)
 }
 
 // ============================================================

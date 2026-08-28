@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package walsync;
+
+option go_package = "github.com/maulanashalihin/walsync/proto/walsyncpb";
+
+service WalSync {
+  // Ship WAL chunk (incremental)
+  rpc ShipWal(WalChunk) returns (Ack);
+  // Ship full DB snapshot
+  rpc ShipSnapshot(Snapshot) returns (Ack);
+  // Health check
+  rpc Health(Empty) returns (HealthResponse);
+}
+
+message WalChunk {
+  int64 offset = 1;
+  bytes data = 2;
+}
+
+message Snapshot {
+  bytes db_data = 1;
+  bytes wal_data = 2;
+}
+
+message Ack {
+  bool ok = 1;
+  string error = 2;
+  int64 applied_offset = 3;
+}
+
+message Empty {}
+
+message HealthResponse {
+  bool ok = 1;
+  int64 db_size = 2;
+  int64 wal_size = 3;
+}

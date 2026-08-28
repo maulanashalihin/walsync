@@ -213,3 +213,54 @@ Current walsync is single-writer (primary only, replicas read-only). Can we supp
 ### Estimated effort
 
 Medium-high. New proto message + new RPC + CDC schema management + LWW apply logic + bi-directional sync loop. ~300 lines of new code. Existing infrastructure (gRPC, reconnect, metrics) reused.
+
+---
+
+# v0.6.0 Research: gRPC → Fiber (fasthttp) Transport
+
+## Problem
+
+gRPC adds overhead that is pure waste for walsync: protobuf encode/decode, HTTP/2 framing, trailing headers, status codes. walsync ships raw bytes — no streaming, no auth, no interceptors, no type safety needed.
+
+## Benchmark (localhost, 200 iterations, Go)
+
+| Payload | gRPC raw | Fiber raw | gRPC+gzip | Fiber+gzip | Fiber advantage |
+|---------|---------|-----------|-----------|------------|-----------------|
+| 4KB sqlite | 0.075ms | 0.055ms | 0.133ms | 0.060ms | **2.2x** (gzip) |
+| 64KB sqlite | 0.200ms | 0.153ms | 0.295ms | 0.170ms | **1.7x** |
+| 1MB sqlite | 1.168ms | 0.793ms | 2.473ms | 1.168ms | **2.1x** |
+| 4MB random | 4.180ms | 3.915ms | 42.580ms | 4.865ms | **8.7x** |
+
+**Key finding**: gRPC gzip is pathologically slow for large payloads — 10x slower than raw. gRPC creates a new gzip compressor per call. Fiber uses `compress/gzip` with manual control, no pathology.
+
+## Why Fiber wins
+
+| gRPC overhead | walsync needs it? |
+|---|---|
+| Protobuf encode/decode | No — ships raw bytes |
+| HTTP/2 framing | No — 3 endpoints, no multiplexing |
+| gRPC gzip (new compressor per call) | No — pathologically slow |
+| Trailing headers + status codes | No — simple `{ok: true}` |
+| gRPC interceptors/auth | No — no auth, no middleware |
+| Bidirectional streaming | No — unary calls only |
+
+## What changed
+
+- Replica: `grpc.Server` → `fiber.New()` (3 routes: `/ship-wal`, `/ship-snapshot`, `/health`)
+- Primary: `grpc.ClientConn` → `fasthttp.Client` (persistent connections)
+- Removed: `proto/` directory, gRPC + protobuf dependencies
+- Fiber `c.Body()` auto-decompresses gzip request bodies (no manual decompression needed)
+
+## A/B test (2 Singapore VPS, 1000 rows)
+
+| Metric | v0.5.0 (gRPC) | v0.6.0 (Fiber) |
+|--------|---------------|----------------|
+| Replication | 1001/1001 ✅ | 1001/1001 ✅ |
+| Binary size | 15.3MB | 11.7MB (24% smaller) |
+| Write time | 9ms | 7ms |
+| Sync latency | ~5s | ~5s (polling-bound) |
+| Reconnect | ✅ | ✅ (fasthttp auto-reconnect + retry) |
+
+## Conclusion
+
+Fiber (fasthttp) is the correct transport for walsync. Unlike language swaps (Rust, Bun) which don't help because walsync is I/O-bound, transport swap changes the I/O path itself — less overhead per ship, smaller binary, fewer dependencies. All v0.5.0 features preserved.

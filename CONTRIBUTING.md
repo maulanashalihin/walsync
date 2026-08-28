@@ -17,6 +17,8 @@ go build -o walsync .
 ```
 walsync/
 ├── main.go          # All code (primary + replica + utilities)
+├── bench/go/        # Transport benchmarks (gRPC vs Fiber)
+├── deploy/          # systemd service files + deploy guide
 ├── examples/        # Sample writer/reader apps
 ├── go.mod           # Go module definition
 └── README.md        # Project documentation
@@ -69,12 +71,10 @@ Deploy `walsync-linux-amd64` to two servers:
 
 ## Roadmap areas
 
-Areas where help is especially welcome:
-
-- **WAL frame-level shipping** — parse WAL frames, ship only changed pages (avoid full snapshot on checkpoint)
+- **~~WAL frame-level shipping~~** — Researched, not viable (checkpoint modifies untracked pages)
 - **TLS + auth** — secure the HTTP transport
 - **Automatic failover** — health checks + replica promotion
-- **gRPC transport** — lower overhead than HTTP for high-throughput
+- **~~gRPC transport~~** — Replaced with Fiber (fasthttp) in v0.6.0, 1.7-2.1x faster
 - **Multi-primary** — conflict resolution (LWW, CRDT, or Merkle tree sync)
 
 ## Reporting bugs

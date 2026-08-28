@@ -214,6 +214,19 @@ Current walsync is single-writer (primary only, replicas read-only). Can we supp
 
 Medium-high. New proto message + new RPC + CDC schema management + LWW apply logic + bi-directional sync loop. ~300 lines of new code. Existing infrastructure (gRPC, reconnect, metrics) reused.
 
+### Decision: NOT PURSUING
+
+Trigger-based CDC + LWW works technically, but the multi-write SQLite replication market is already crowded with mature solutions:
+
+- **Marmot** — CDC + 2PC, HLC-based LWW, production-ready
+- **cr-sqlite** — CRDT extension, column-level merge, growing ecosystem
+- **rqlite** — Raft consensus, proven in production
+- **dqlite** — Raft consensus, Canonical-backed
+- **LiteFS** — Single-primary with failover (not multi-write but solves similar need)
+- **Turso** — Embedded + remote write, commercial product
+
+walsync's niche is different: **lightweight single-writer WAL shipping** — zero-dependency, embedded SQLite, background process. No multi-write, no consensus, no FUSE. That space is not crowded.
+
 ---
 
 # v0.6.0 Research: gRPC → Fiber (fasthttp) Transport

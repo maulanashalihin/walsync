@@ -75,7 +75,7 @@ Deploy `walsync-linux-amd64` to two servers:
 - **TLS + auth** — secure the HTTP transport
 - **Automatic failover** — health checks + replica promotion
 - **~~gRPC transport~~** — Replaced with Fiber (fasthttp) in v0.6.0, 1.7-2.1x faster
-- **Multi-primary** — conflict resolution (LWW, CRDT, or Merkle tree sync)
+- **~~Multi-primary~~** — Researched, not pursuing (market crowded: Marmot, cr-sqlite, rqlite, dqlite, LiteFS, Turso)
 
 ## Reporting bugs
 

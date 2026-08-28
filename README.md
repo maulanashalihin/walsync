@@ -20,7 +20,7 @@ Every existing SQLite replication tool forces a tradeoff:
 Result: 221K read QPS + 94K write QPS + live multi-server replication
 ```
 
-The tradeoff: eventual consistency (~1-2s sync delay) and single-writer (primary only).
+The tradeoff: eventual consistency (~100ms sync delay) and single-writer (primary only).
 
 ## How it works
 
@@ -134,7 +134,7 @@ Works with any SQLite binding in any language. The only requirement: **WAL mode*
 # On primary: write a row
 sqlite3 /data/app.db "INSERT INTO users(name) VALUES('test');"
 
-# On replica: read it (within ~1-2 seconds)
+# On replica: read it (within ~100ms)
 sqlite3 /data/app.db "SELECT * FROM users;"
 ```
 
@@ -230,7 +230,7 @@ Examples:
 
 - **Single-writer** — Only primary accepts writes. Replicas are read-only.
 - **No failover** — No automatic primary promotion. Manual failover only.
-- **Eventual consistency** — Sync delay ~1-2 seconds depending on network.
+- **Eventual consistency** — Sync delay ~100ms median (measured: 33-210ms, 2 Singapore VPS, ~20ms RTT)
 - **No auth** — HTTP endpoints are unauthenticated. Use behind VPN/firewall.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
 
@@ -239,7 +239,7 @@ Examples:
 - [x] ~~WAL frame-level incremental shipping~~ — Not viable (checkpoint modifies untracked pages, causes corruption)
 - [ ] TLS + token authentication
 - [ ] Automatic failover (promote replica on primary failure)
-- [ ] Multi-primary with conflict resolution (LWW or CRDT)
+- [x] ~~Multi-primary with conflict resolution~~ — Researched, not pursuing (market crowded: Marmot, cr-sqlite, rqlite, dqlite, LiteFS, Turso)
 - [x] ~~Prometheus metrics endpoint~~ — Shipped in v0.5.0
 - [x] ~~gRPC → Fiber (fasthttp) transport~~ — Shipped in v0.6.0 (1.7-2.1x faster, 24% smaller binary)
 
@@ -249,9 +249,8 @@ Examples:
 
 | Operation | Sync delay | Result |
 |-----------|-----------:|--------|
-| INSERT | ~1-2s | ✅ All rows replicated |
-| UPDATE | ~1-2s | ✅ Updates replicated |
-| DELETE | ~1-2s | ✅ Deletes replicated |
+| Single write | ~100ms median (33-210ms) | ✅ All rows replicated |
+| Burst (50 writes) | ~94ms (debounced batch) | ✅ 50/50 rows replicated |
 | Initial snapshot | ~1s | ✅ Full DB shipped |
 | Checkpoint re-sync | ~1-2s | ✅ Snapshot re-shipped |
 

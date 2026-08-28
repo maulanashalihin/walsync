@@ -4,19 +4,21 @@ import (
 	"context"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-"github.com/fsnotify/fsnotify"
-gzip "google.golang.org/grpc/encoding/gzip"
-"google.golang.org/grpc"
-"google.golang.org/grpc/credentials/insecure"
-"google.golang.org/grpc/keepalive"
+	"github.com/fsnotify/fsnotify"
+	gzip "google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 
 	pb "github.com/maulanashalihin/walsync/proto/walsyncpb"
 )
@@ -32,11 +34,38 @@ func main() {
 	dbPath := flag.String("db", "", "path to SQLite database file")
 	replicas := flag.String("replicas", "", "comma-separated replica addresses (primary mode, e.g. host:port)")
 	listen := flag.String("listen", ":9090", "gRPC listen address (replica mode)")
+	metricsAddr := flag.String("metrics", "", "HTTP metrics listen address (e.g. :9091, empty = disabled)")
+	configPath := flag.String("config", "", "path to TOML config file (CLI flags override config)")
 	flag.Parse()
+
+	// Load config file if specified
+	cfg := loadConfig(*configPath)
+
+	// CLI flags override config file values
+	if *mode == "" {
+		*mode = cfg.Mode
+	}
+	if *dbPath == "" {
+		*dbPath = cfg.DBPath
+	}
+	if *replicas == "" {
+		*replicas = cfg.Replicas
+	}
+	if *listen == ":9090" && cfg.Listen != "" {
+		*listen = cfg.Listen
+	}
+	if *metricsAddr == "" {
+		*metricsAddr = cfg.Metrics
+	}
 
 	if *mode == "" || *dbPath == "" {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	// Start metrics server if enabled
+	if *metricsAddr != "" {
+		go startMetricsServer(*metricsAddr)
 	}
 
 	switch *mode {
@@ -47,6 +76,93 @@ func main() {
 	default:
 		log.Fatalf("unknown mode: %s (use primary or replica)", *mode)
 	}
+}
+
+// config holds values parsed from TOML config file
+type config struct {
+	Mode     string
+	DBPath   string
+	Replicas string
+	Listen   string
+	Metrics  string
+}
+
+// loadConfig reads a minimal TOML config file (key = "value" format).
+// Returns empty config if path is empty or file doesn't exist.
+func loadConfig(path string) *config {
+	cfg := &config{}
+	if path == "" {
+		return cfg
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("error reading config file %s: %v", path, err)
+	}
+	for _, line := range splitLines(string(data)) {
+		line = trimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		eq := indexOf(line, '=')
+		if eq < 0 {
+			continue
+		}
+		key := trimSpace(line[:eq])
+		val := trimSpace(line[eq+1:])
+		// Strip quotes
+		if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"') {
+			val = val[1 : len(val)-1]
+		}
+		switch key {
+		case "mode":
+			cfg.Mode = val
+		case "db":
+			cfg.DBPath = val
+		case "replicas":
+			cfg.Replicas = val
+		case "listen":
+			cfg.Listen = val
+		case "metrics":
+			cfg.Metrics = val
+		}
+	}
+	log.Printf("config loaded from %s", path)
+	return cfg
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := range s {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+func trimSpace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
+
+func indexOf(s string, c byte) int {
+	for i := range s {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // ============================================================
@@ -265,6 +381,7 @@ func shipSnapshotGRPC(dbPath, walPath string, conns []*replicaConn) {
 			ack, err = rc.cli.ShipSnapshot(ctx2, snap)
 			if err != nil {
 				log.Printf("retry snapshot to %s failed: %v", rc.addr, err)
+				metricsIncSnapshotError()
 				return
 			}
 		}
@@ -276,6 +393,7 @@ func shipSnapshotGRPC(dbPath, walPath string, conns []*replicaConn) {
 		}(rc)
 	}
 	wg.Wait()
+	metricsIncSnapshot(int64(len(dbData) + len(walData)))
 }
 
 func shipWALGRPC(walPath string, offset, size int64, conns []*replicaConn) {
@@ -329,6 +447,7 @@ func shipWALGRPC(walPath string, offset, size int64, conns []*replicaConn) {
 			ack, err = rc.cli.ShipWal(ctx2, chunk)
 			if err != nil {
 				log.Printf("retry wal ship to %s failed: %v", rc.addr, err)
+				metricsIncWalError()
 				return
 			}
 		}
@@ -340,6 +459,7 @@ func shipWALGRPC(walPath string, offset, size int64, conns []*replicaConn) {
 	wg.Wait()
 
 	log.Printf("WAL shipped: %d bytes from offset %d to %d replicas", len(data), offset, len(conns))
+	metricsIncWalShips(int64(len(data)))
 }
 
 // ============================================================
@@ -557,4 +677,77 @@ func parseWALFrames(data []byte, pageSize int) []walFrame {
 	}
 
 	return frames
+}
+
+// ============================================================
+// METRICS — Prometheus-compatible HTTP endpoint
+// ============================================================
+
+var (
+	metricsMu             sync.Mutex
+	metricsWalShips       int64
+	metricsWalBytes       int64
+	metricsWalErrors      int64
+	metricsSnapshots      int64
+	metricsSnapshotBytes  int64
+	metricsSnapshotErrors int64
+	metricsLastShipUnix   int64
+)
+
+func metricsIncWalShips(bytes int64) {
+	metricsMu.Lock()
+	metricsWalShips++
+	metricsWalBytes += bytes
+	metricsLastShipUnix = time.Now().Unix()
+	metricsMu.Unlock()
+}
+
+func metricsIncWalError() {
+	metricsMu.Lock()
+	metricsWalErrors++
+	metricsMu.Unlock()
+}
+
+func metricsIncSnapshot(bytes int64) {
+	metricsMu.Lock()
+	metricsSnapshots++
+	metricsSnapshotBytes += bytes
+	metricsLastShipUnix = time.Now().Unix()
+	metricsMu.Unlock()
+}
+
+func metricsIncSnapshotError() {
+	metricsMu.Lock()
+	metricsSnapshotErrors++
+	metricsMu.Unlock()
+}
+
+func startMetricsServer(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metricsMu.Lock()
+		walShips := metricsWalShips
+		walBytes := metricsWalBytes
+		walErrors := metricsWalErrors
+		snaps := metricsSnapshots
+		snapBytes := metricsSnapshotBytes
+		snapErrors := metricsSnapshotErrors
+		lastShip := metricsLastShipUnix
+		metricsMu.Unlock()
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# walsync metrics\n")
+		fmt.Fprintf(w, "walsync_wal_ships_total %d\n", walShips)
+		fmt.Fprintf(w, "walsync_wal_shipped_bytes_total %d\n", walBytes)
+		fmt.Fprintf(w, "walsync_wal_ship_errors_total %d\n", walErrors)
+		fmt.Fprintf(w, "walsync_snapshot_ships_total %d\n", snaps)
+		fmt.Fprintf(w, "walsync_snapshot_shipped_bytes_total %d\n", snapBytes)
+		fmt.Fprintf(w, "walsync_snapshot_ship_errors_total %d\n", snapErrors)
+		fmt.Fprintf(w, "walsync_last_ship_timestamp_seconds %d\n", lastShip)
+	})
+
+	log.Printf("metrics server listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("metrics server error: %v", err)
+	}
 }

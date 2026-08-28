@@ -213,3 +213,72 @@ Current walsync is single-writer (primary only, replicas read-only). Can we supp
 ### Estimated effort
 
 Medium-high. New proto message + new RPC + CDC schema management + LWW apply logic + bi-directional sync loop. ~300 lines of new code. Existing infrastructure (gRPC, reconnect, metrics) reused.
+
+---
+
+# v0.6.0 Research: Rust Rewrite — PERFORMANCE IMPROVED
+
+## Question
+
+Apakah walsync ditulis ulang di Rust akan meningkatkan performa? Jika ya, layak publish menggantikan Go.
+
+## Microbenchmark (Mac M4, 1000 iterations, 1MB WAL file)
+
+| Benchmark | Go (ms/op) | Rust (ms/op) | Improvement |
+|-----------|-----------|-------------|-------------|
+| file_read | 0.058 | 0.030 | **1.9x** |
+| read+gzip | 1.516 | 0.952 | **1.6x** |
+| read+proto+gzip (hot path) | 1.568 | 0.967 | **1.6x** |
+| gzip_only | 1.442 | 0.940 | **1.5x** |
+| proto_only | 0.049 | 0.015 | **3.3x** |
+
+## A/B Test (2 Singapore VPS, 1000 rows × 1KB)
+
+| Metric | Go v0.5.0 | Rust v0.6.0 |
+|--------|-----------|-------------|
+| Write time (1000 rows) | 25ms | 23ms |
+| Replica rows | 1000 ✅ | 1000 ✅ |
+| DB size | 1032192 | 1032192 |
+| Binary size | 15.3MB | 4.3MB (**3.6x smaller**) |
+| Sync latency | ~1-2s | ~1-2s |
+
+## Analysis
+
+**Hot path (read+proto+gzip) 1.6x faster** — ini CPU-bound work yang Rust excels at.
+
+**Write time hampir sama** (25ms vs 23ms) karena write time = SQLite insert time, bukan walsync overhead. walsync tidak participate di write path.
+
+**Binary 3.6x smaller** — Go 15.3MB → Rust 4.3MB. Go punya runtime + GC bundled, Rust punya minimal runtime.
+
+**Sync latency sama** (~1-2s) karena latency dominated by network RTT + debounce (50ms), bukan CPU.
+
+## Features ported from Go v0.5.0
+
+- ✅ gRPC persistent HTTP/2 (tonic)
+- ✅ gzip compression (flate2 + tonic gzip feature)
+- ✅ keepalive (tonic transport keep_alive)
+- ✅ reconnect with retry
+- ✅ WAL salt detection (bytes 16-23)
+- ✅ Config file (TOML, `toml` crate)
+- ✅ Prometheus metrics endpoint (hyper HTTP server)
+- ✅ Polling + debounce (50ms)
+
+## Rust-specific improvements
+
+- **Zero GC** — no garbage collection pauses, predictable memory
+- **Memory safe** — no data races, no use-after-free
+- **Error handling** — `Result<T, E>` forces explicit error handling
+- **Binary size** — 4.3MB vs 15.3MB, better for container/edge deploy
+
+## Tradeoffs
+
+- **Compile time** — Rust 18s (release) vs Go 0.7s. Slower dev cycle.
+- **Cross-compile** — Rust butuh target + linker install. Go cross-compile trivial (`GOOS=linux GOARCH=amd64`).
+- **Ecosystem** — Go gRPC lebih mature (grpc-go). Rust tonic juga mature tapi community lebih kecil.
+- **Proto codegen** — Go: `protoc-gen-go` + `protoc-gen-go-grpc`. Rust: `tonic-build` di build.rs (simpler).
+
+## Conclusion
+
+**Rust rewrite layak publish.** Hot path 1.6x faster, binary 3.6x smaller, same features. Tradeoff compile time acceptable untuk release binary (build once, deploy many).
+
+**Branch**: `rust-rewrite` di GitHub. Merge ke main setelah cleanup.

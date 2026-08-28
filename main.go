@@ -12,9 +12,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+"github.com/fsnotify/fsnotify"
+gzip "google.golang.org/grpc/encoding/gzip"
+"google.golang.org/grpc"
+"google.golang.org/grpc/credentials/insecure"
+"google.golang.org/grpc/keepalive"
 
 	pb "github.com/maulanashalihin/walsync/proto/walsyncpb"
 )
@@ -77,6 +79,12 @@ func runPrimary(dbPath string, replicasCSV string) {
 		}
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:                10 * time.Second,
+				Timeout:             5 * time.Second,
+				PermitWithoutStream: true,
+			}),
+			grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)),
 		)
 		if err != nil {
 			log.Fatalf("failed to connect to replica %s: %v", addr, err)
@@ -301,7 +309,16 @@ func runReplica(dbPath string, listen string) {
 		log.Fatalf("failed to listen on %s: %v", listen, err)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 	pb.RegisterWalSyncServer(grpcServer, &replicaServer{
 		dbPath:  dbPath,
 		walPath: walPath,

@@ -1,0 +1,23 @@
+# Binaries
+walsync
+walsync-linux-amd64
+walsync-*
+
+# SQLite test files
+*.db
+*.db-wal
+*.db-shm
+*.db.tmp
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

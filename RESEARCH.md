@@ -127,3 +127,89 @@ Or: detect if fsnotify event fired recently, skip polling for that cycle.
 | gRPC keepalive | 🟡 fast failure detection | 10 lines | P0 |
 | Page-level shipping | 🔴 avoid full snapshot | medium-hard | P1 |
 | Skip polling on Linux | 🟢 negligible CPU | 5 lines | P2 |
+
+---
+
+# v0.6.0 Research: Multi-Writer Support
+
+## Problem
+
+Current walsync is single-writer (primary only, replicas read-only). Can we support multiple writers — two or more nodes writing concurrently?
+
+## Approach 1: Bi-directional WAL shipping — FAILED
+
+**Test**: Both nodes run as primary+replica, ship WAL to each other.
+
+**Result**: Both nodes overwrite each other's DB files via snapshot. Data loss. No conflict detection.
+
+**Root cause**: WAL is page-level, not row-level. Two nodes writing to different rows may modify the same page (index, b-tree, page 1 header). Page-level changes from different nodes cannot be merged — each node's WAL has different salt, different page structure.
+
+**Conclusion**: WAL page-level shipping fundamentally cannot support multi-write. This is the same limitation that caused #3 (page-level shipping corruption) to fail.
+
+## Approach 2: Trigger-based CDC + LWW — WORKS
+
+**Architecture**: Row-level logical replication using SQLite triggers.
+
+### How it works
+
+1. **CDC tables**: Each node has `_cdc_changes` table + `_cdc_sync_flag` table
+2. **Triggers**: AFTER INSERT/UPDATE/DELETE triggers capture row-level changes into `_cdc_changes` as JSON
+3. **Sync flag**: `WHEN (SELECT value FROM _cdc_sync_flag) = 0` — triggers skip during remote change application (prevents infinite loop)
+4. **Ship changes**: Node ships unsynced `_cdc_changes` rows to peers via gRPC
+5. **Apply with LWW**: Receiver compares `timestamp` — if remote is newer, apply; else skip
+6. **Mark synced**: After shipping, mark changes as `synced = 1`
+
+### Test results
+
+| Scenario | Result |
+----------|--------|
+| Bi-directional INSERT (UUID PKs) | ✅ Both nodes converge |
+| Same row, different timestamps (LWW) | ✅ Newer version wins |
+| UPDATE + INSERT concurrent | ✅ Both applied correctly |
+| Continuous sync (round 2) | ✅ Converged, no loop |
+| Auto-increment PK collision | ❌ Use UUID to avoid |
+
+### Requirements
+
+- **UUID primary keys**: Auto-increment causes PK collision across nodes
+- **`updated_at` column**: Required for LWW comparison (timestamp)
+- **CDC schema setup**: Triggers + `_cdc_changes` + `_cdc_sync_flag` per table
+- **`INSERT OR REPLACE`**: For idempotent apply
+
+### Limitations
+
+- **LWW only**: No CRDT, no custom merge. Last write wins by timestamp.
+- **No transaction support**: Each row change is independent (no multi-row atomicity)
+- **Schema modification**: User must add triggers + CDC tables
+- **Column-level**: Currently captures all columns as JSON blob. No column-level CRDT.
+- **Clock skew**: LWW depends on synchronized clocks. HLC (Hybrid Logical Clock) would be more robust.
+
+### Comparison with other tools
+
+| Tool | Approach | Multi-write | Conflict resolution |
+------|----------|-------------|-------------------|
+| walsync (current) | WAL page-level | ❌ Single-writer | N/A |
+| walsync (proposed) | Trigger CDC + LWW | ✅ | LWW by timestamp |
+| Marmot | CDC + 2PC (preupdate hook) | ✅ | 2PC + LWW (HLC) |
+| cr-sqlite | CRDT extension | ✅ | CRDT (LWW, counters, MV-register) |
+| LiteFS | LTX + FUSE | ❌ Single-primary | Failover only |
+| dqlite | Raft consensus | ❌ Single-leader | Raft |
+
+### Implementation plan for walsync
+
+1. New mode: `-mode multi` (bi-directional CDC sync)
+2. New gRPC RPC: `ShipChanges(ChangeSet)` — ship row-level changes
+3. CDC schema auto-setup: walsync creates triggers + CDC tables on startup
+4. Bi-directional: each node ships changes to all peers
+5. LWW apply: compare `updated_at` timestamp
+6. Polling: check `_cdc_changes` for unsynced rows every 50ms (reuse existing debounce)
+
+### What would NOT change
+
+- Existing `-mode primary` / `-mode replica` (WAL shipping) stays as-is
+- gRPC transport, compression, keepalive, reconnect — all reused
+- Metrics, config file — all reused
+
+### Estimated effort
+
+Medium-high. New proto message + new RPC + CDC schema management + LWW apply logic + bi-directional sync loop. ~300 lines of new code. Existing infrastructure (gRPC, reconnect, metrics) reused.

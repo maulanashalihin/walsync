@@ -1,26 +1,23 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	gzip "google.golang.org/grpc/encoding/gzip"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
-
-	pb "github.com/maulanashalihin/walsync/proto/walsyncpb"
+	"github.com/gofiber/fiber/v2"
+	"github.com/valyala/fasthttp"
 )
 
 // WAL header size
@@ -166,41 +163,25 @@ func indexOf(s string, c byte) int {
 }
 
 // ============================================================
-// PRIMARY MODE — gRPC client, ships WAL to replicas
+// PRIMARY MODE — HTTP client (fasthttp), ships WAL to replicas
 // ============================================================
 
-// replicaConn holds a persistent gRPC connection to one replica
+// replicaConn holds a persistent fasthttp client to one replica
 type replicaConn struct {
-	addr string
-	conn *grpc.ClientConn
-	cli  pb.WalSyncClient
-	mu   sync.Mutex
+	addr   string
+	client *fasthttp.Client
 }
 
-// reconnect closes the old connection and establishes a new one
-func (rc *replicaConn) reconnect() error {
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-
-	if rc.conn != nil {
-		rc.conn.Close()
+func newReplicaConn(addr string) *replicaConn {
+	return &replicaConn{
+		addr: addr,
+		client: &fasthttp.Client{
+			MaxConnsPerHost:     4,
+			MaxIdleConnDuration: 30 * time.Second,
+			ReadTimeout:         10 * time.Second,
+			WriteTimeout:        10 * time.Second,
+		},
 	}
-
-	conn, err := grpc.NewClient(rc.addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             5 * time.Second,
-			PermitWithoutStream: true,
-		}),
-		grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)),
-	)
-	if err != nil {
-		return err
-	}
-	rc.conn = conn
-	rc.cli = pb.NewWalSyncClient(conn)
-	return nil
 }
 
 func runPrimary(dbPath string, replicasCSV string) {
@@ -213,28 +194,19 @@ func runPrimary(dbPath string, replicasCSV string) {
 
 	walPath := dbPath + "-wal"
 
-	// Establish persistent gRPC connections to all replicas
+	// Create persistent HTTP clients for all replicas
 	conns := make([]*replicaConn, 0, len(replicaAddrs))
 	for _, addr := range replicaAddrs {
 		if !hasPort(addr) {
 			addr = addr + ":9090"
 		}
-		rc := &replicaConn{addr: addr}
-		if err := rc.reconnect(); err != nil {
-			log.Fatalf("failed to connect to replica %s: %v", addr, err)
-		}
-		conns = append(conns, rc)
-		log.Printf("connected to replica %s", addr)
+		conns = append(conns, newReplicaConn(addr))
+		log.Printf("replica client ready: %s", addr)
 	}
-	defer func() {
-		for _, rc := range conns {
-			rc.conn.Close()
-		}
-	}()
 
 	// Ship initial snapshot to all replicas
 	log.Println("shipping initial snapshot...")
-	shipSnapshotGRPC(dbPath, walPath, conns)
+	shipSnapshotHTTP(dbPath, walPath, conns)
 	log.Println("initial snapshot shipped")
 
 	// Watch WAL file for changes
@@ -290,7 +262,7 @@ func runPrimary(dbPath string, replicasCSV string) {
 				newWalSize := fileSize(walPath)
 				if newWalSize == 0 || newWalSize < lastShippedSize {
 					log.Println("checkpoint detected, shipping snapshot...")
-					shipSnapshotGRPC(dbPath, walPath, conns)
+					shipSnapshotHTTP(dbPath, walPath, conns)
 					lastShippedSize = fileSize(walPath)
 					lastShippedDBMod = fileModTime(dbPath)
 				}
@@ -305,7 +277,7 @@ func runPrimary(dbPath string, replicasCSV string) {
 			currentDBMod := fileModTime(dbPath)
 			if currentDBMod != lastShippedDBMod {
 				log.Printf("DB file modified, shipping snapshot...")
-				shipSnapshotGRPC(dbPath, walPath, conns)
+				shipSnapshotHTTP(dbPath, walPath, conns)
 				lastShippedSize = fileSize(walPath)
 				lastShippedDBMod = currentDBMod
 				lastSalt1, lastSalt2 = walSalt(walPath)
@@ -316,7 +288,7 @@ func runPrimary(dbPath string, replicasCSV string) {
 			if curSalt1 != lastSalt1 || curSalt2 != lastSalt2 {
 				if curSalt1 != 0 { // skip if WAL doesn't exist
 					log.Printf("WAL salt changed, shipping snapshot...")
-					shipSnapshotGRPC(dbPath, walPath, conns)
+					shipSnapshotHTTP(dbPath, walPath, conns)
 					lastShippedSize = fileSize(walPath)
 					lastSalt1, lastSalt2 = curSalt1, curSalt2
 				}
@@ -327,7 +299,7 @@ func runPrimary(dbPath string, replicasCSV string) {
 			if currentSize <= lastShippedSize {
 				continue
 			}
-			shipWALGRPC(walPath, lastShippedSize, currentSize, conns)
+			shipWALHTTP(walPath, lastShippedSize, currentSize, conns)
 			lastShippedSize = currentSize
 
 		case err, ok := <-watcher.Errors:
@@ -339,7 +311,9 @@ func runPrimary(dbPath string, replicasCSV string) {
 	}
 }
 
-func shipSnapshotGRPC(dbPath, walPath string, conns []*replicaConn) {
+// shipSnapshotHTTP ships full DB+WAL snapshot to all replicas via HTTP.
+// Body format: 8-byte big-endian db_len + db_data + wal_data, gzip compressed.
+func shipSnapshotHTTP(dbPath, walPath string, conns []*replicaConn) {
 	dbData, err := os.ReadFile(dbPath)
 	if err != nil {
 		log.Printf("error reading db file: %v", err)
@@ -355,48 +329,69 @@ func shipSnapshotGRPC(dbPath, walPath string, conns []*replicaConn) {
 		}
 	}
 
-	snap := &pb.Snapshot{
-		DbData:  dbData,
-		WalData: walData,
-	}
+	// Pack: 8-byte big-endian db_len + db_data + wal_data
+	packed := make([]byte, 8+len(dbData)+len(walData))
+	binary.BigEndian.PutUint64(packed[:8], uint64(len(dbData)))
+	copy(packed[8:], dbData)
+	copy(packed[8+len(dbData):], walData)
+
+	// Gzip compress
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	gw.Write(packed)
+	gw.Close()
+	compressed := buf.Bytes()
 
 	var wg sync.WaitGroup
 	for _, rc := range conns {
 		wg.Add(1)
 		go func(rc *replicaConn) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
 
-		ack, err := rc.cli.ShipSnapshot(ctx, snap)
-		if err != nil {
-			log.Printf("error sending snapshot to %s: %v, reconnecting...", rc.addr, err)
-			if rerr := rc.reconnect(); rerr != nil {
-				log.Printf("reconnect to %s failed: %v", rc.addr, rerr)
-				return
+			url := "http://" + rc.addr + "/ship-snapshot"
+			req := fasthttp.AcquireRequest()
+			res := fasthttp.AcquireResponse()
+			defer fasthttp.ReleaseRequest(req)
+			defer fasthttp.ReleaseResponse(res)
+
+			req.SetRequestURI(url)
+			req.Header.SetMethod("POST")
+			req.Header.Set("Content-Type", "application/octet-stream")
+			req.Header.Set("Content-Encoding", "gzip")
+			req.SetBody(compressed)
+
+			if err := rc.client.DoTimeout(req, res, 10*time.Second); err != nil {
+				log.Printf("error sending snapshot to %s: %v, retrying...", rc.addr, err)
+				// Retry once
+				req.Reset()
+				res.Reset()
+				req.SetRequestURI(url)
+				req.Header.SetMethod("POST")
+				req.Header.Set("Content-Type", "application/octet-stream")
+				req.Header.Set("Content-Encoding", "gzip")
+				req.SetBody(compressed)
+				if err := rc.client.DoTimeout(req, res, 10*time.Second); err != nil {
+					log.Printf("retry snapshot to %s failed: %v", rc.addr, err)
+					metricsIncSnapshotError()
+					return
+				}
 			}
-			// Retry once
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel2()
-			ack, err = rc.cli.ShipSnapshot(ctx2, snap)
-			if err != nil {
-				log.Printf("retry snapshot to %s failed: %v", rc.addr, err)
+
+			if res.StatusCode() != 200 {
+				log.Printf("snapshot to %s failed: HTTP %d", rc.addr, res.StatusCode())
 				metricsIncSnapshotError()
 				return
 			}
-		}
-		if !ack.Ok {
-			log.Printf("snapshot to %s failed: %s", rc.addr, ack.Error)
-			return
-		}
-		log.Printf("snapshot shipped to %s (%d bytes db, %d bytes wal)", rc.addr, len(dbData), len(walData))
+			log.Printf("snapshot shipped to %s (%d bytes db, %d bytes wal)", rc.addr, len(dbData), len(walData))
 		}(rc)
 	}
 	wg.Wait()
 	metricsIncSnapshot(int64(len(dbData) + len(walData)))
 }
 
-func shipWALGRPC(walPath string, offset, size int64, conns []*replicaConn) {
+// shipWALHTTP ships incremental WAL bytes to all replicas via HTTP.
+// Body: gzip-compressed WAL bytes from offset.
+func shipWALHTTP(walPath string, offset, size int64, conns []*replicaConn) {
 	f, err := os.Open(walPath)
 	if err != nil {
 		log.Printf("error opening wal file: %v", err)
@@ -421,158 +416,167 @@ func shipWALGRPC(walPath string, offset, size int64, conns []*replicaConn) {
 		return
 	}
 
-	chunk := &pb.WalChunk{
-		Offset: offset,
-		Data:   data,
-	}
+	// Gzip compress
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	gw.Write(data)
+	gw.Close()
+	compressed := buf.Bytes()
+
+	offsetStr := strconv.FormatInt(offset, 10)
 
 	var wg sync.WaitGroup
 	for _, rc := range conns {
 		wg.Add(1)
 		go func(rc *replicaConn) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
 
-		ack, err := rc.cli.ShipWal(ctx, chunk)
-		if err != nil {
-			log.Printf("error shipping wal to %s: %v, reconnecting...", rc.addr, err)
-			if rerr := rc.reconnect(); rerr != nil {
-				log.Printf("reconnect to %s failed: %v", rc.addr, rerr)
-				return
+			url := "http://" + rc.addr + "/ship-wal"
+			req := fasthttp.AcquireRequest()
+			res := fasthttp.AcquireResponse()
+			defer fasthttp.ReleaseRequest(req)
+			defer fasthttp.ReleaseResponse(res)
+
+			req.SetRequestURI(url)
+			req.Header.SetMethod("POST")
+			req.Header.Set("Content-Type", "application/octet-stream")
+			req.Header.Set("Content-Encoding", "gzip")
+			req.Header.Set("X-Walsync-Offset", offsetStr)
+			req.SetBody(compressed)
+
+			if err := rc.client.DoTimeout(req, res, 5*time.Second); err != nil {
+				log.Printf("error shipping wal to %s: %v, retrying...", rc.addr, err)
+				// Retry once
+				req.Reset()
+				res.Reset()
+				req.SetRequestURI(url)
+				req.Header.SetMethod("POST")
+				req.Header.Set("Content-Type", "application/octet-stream")
+				req.Header.Set("Content-Encoding", "gzip")
+				req.Header.Set("X-Walsync-Offset", offsetStr)
+				req.SetBody(compressed)
+				if err := rc.client.DoTimeout(req, res, 5*time.Second); err != nil {
+					log.Printf("retry wal ship to %s failed: %v", rc.addr, err)
+					metricsIncWalError()
+					return
+				}
 			}
-			// Retry once
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel2()
-			ack, err = rc.cli.ShipWal(ctx2, chunk)
-			if err != nil {
-				log.Printf("retry wal ship to %s failed: %v", rc.addr, err)
+
+			if res.StatusCode() != 200 {
+				log.Printf("wal ship to %s failed: HTTP %d", rc.addr, res.StatusCode())
 				metricsIncWalError()
-				return
 			}
-		}
-		if !ack.Ok {
-			log.Printf("wal ship to %s failed: %s", rc.addr, ack.Error)
-		}
 		}(rc)
 	}
 	wg.Wait()
 
-	log.Printf("WAL shipped: %d bytes from offset %d to %d replicas", len(data), offset, len(conns))
+	log.Printf("WAL shipped: %d bytes (compressed %d) from offset %d to %d replicas", len(data), len(compressed), offset, len(conns))
 	metricsIncWalShips(int64(len(data)))
 }
 
 // ============================================================
-// REPLICA MODE — gRPC server, receives WAL from primary
+// REPLICA MODE — Fiber HTTP server, receives WAL from primary
 // ============================================================
-
-type replicaServer struct {
-	pb.UnimplementedWalSyncServer
-	dbPath  string
-	walPath string
-}
 
 func runReplica(dbPath string, listen string) {
 	walPath := dbPath + "-wal"
 	log.Printf("walsync replica starting | db=%s | listen=%s", dbPath, listen)
 
-	lis, err := net.Listen("tcp", listen)
-	if err != nil {
-		log.Fatalf("failed to listen on %s: %v", listen, err)
-	}
-
-	grpcServer := grpc.NewServer(
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time:    30 * time.Second,
-			Timeout: 10 * time.Second,
-		}),
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             5 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	)
-	pb.RegisterWalSyncServer(grpcServer, &replicaServer{
-		dbPath:  dbPath,
-		walPath: walPath,
+	app := fiber.New(fiber.Config{
+		DisableStartupMessage: true,
+		BodyLimit:             16 * 1024 * 1024,
 	})
 
-	log.Printf("replica listening on %s (gRPC)", listen)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("server error: %v", err)
-	}
-}
-
-func (s *replicaServer) ShipSnapshot(ctx context.Context, snap *pb.Snapshot) (*pb.Ack, error) {
-	// Write DB to temp file, then atomically replace
-	tmpPath := s.dbPath + ".tmp"
-	if err := os.WriteFile(tmpPath, snap.DbData, 0644); err != nil {
-		return &pb.Ack{Ok: false, Error: err.Error()}, nil
-	}
-
-	// Remove existing WAL (stale)
-	os.Remove(s.walPath)
-	os.Remove(s.dbPath + "-shm")
-
-	if err := os.Rename(tmpPath, s.dbPath); err != nil {
-		return &pb.Ack{Ok: false, Error: err.Error()}, nil
-	}
-
-	// Write WAL if provided
-	if len(snap.WalData) > 0 {
-		if err := os.WriteFile(s.walPath, snap.WalData, 0644); err != nil {
-			return &pb.Ack{Ok: false, Error: err.Error()}, nil
+	// POST /ship-wal — receive incremental WAL bytes
+	app.Post("/ship-wal", func(c *fiber.Ctx) error {
+		// Fiber auto-decompresses gzip body based on Content-Encoding header
+		data := c.Body()
+		if len(data) == 0 {
+			return c.JSON(fiber.Map{"ok": true})
 		}
-	}
 
-	log.Printf("snapshot received: %d bytes db, %d bytes wal", len(snap.DbData), len(snap.WalData))
-	return &pb.Ack{Ok: true}, nil
-}
 
-func (s *replicaServer) ShipWal(ctx context.Context, chunk *pb.WalChunk) (*pb.Ack, error) {
-	if len(chunk.Data) == 0 {
-		return &pb.Ack{Ok: true}, nil
-	}
+		offset, _ := strconv.ParseInt(string(c.Get("X-Walsync-Offset")), 10, 64)
 
-	offset := chunk.Offset
-
-	var f *os.File
-	var err error
-	if offset == 0 {
-		// Full WAL replacement
-		f, err = os.Create(s.walPath)
-		if err != nil {
-			return &pb.Ack{Ok: false, Error: err.Error()}, nil
-		}
-	} else {
-		f, err = os.OpenFile(s.walPath, os.O_WRONLY, 0644)
-		if err != nil {
-			f, err = os.Create(s.walPath)
+		var f *os.File
+		var err error
+		if offset == 0 {
+			f, err = os.Create(walPath)
+		} else {
+			f, err = os.OpenFile(walPath, os.O_WRONLY, 0644)
 			if err != nil {
-				return &pb.Ack{Ok: false, Error: err.Error()}, nil
+				f, err = os.Create(walPath)
+			}
+			if err == nil {
+				if _, err = f.Seek(offset, 0); err != nil {
+					f.Close()
+					return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
+				}
 			}
 		}
-		if _, err := f.Seek(offset, 0); err != nil {
-			f.Close()
-			return &pb.Ack{Ok: false, Error: err.Error()}, nil
+		if err != nil {
+			return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
 		}
-	}
 
-	if _, err := f.Write(chunk.Data); err != nil {
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
+		}
 		f.Close()
-		return &pb.Ack{Ok: false, Error: err.Error()}, nil
+
+		log.Printf("WAL received: %d bytes at offset %d", len(data), offset)
+		return c.JSON(fiber.Map{"ok": true, "applied_offset": offset + int64(len(data))})
+	})
+
+	// POST /ship-snapshot — receive full DB+WAL snapshot
+	app.Post("/ship-snapshot", func(c *fiber.Ctx) error {
+		// Fiber auto-decompresses gzip body based on Content-Encoding header
+		data := c.Body()
+
+		// Unpack: 8-byte big-endian db_len + db_data + wal_data
+		if len(data) < 8 {
+			return c.JSON(fiber.Map{"ok": false, "error": "snapshot too small"})
+		}
+		dbLen := binary.BigEndian.Uint64(data[:8])
+		if uint64(len(data)) < 8+dbLen {
+			return c.JSON(fiber.Map{"ok": false, "error": "snapshot truncated"})
+		}
+		dbData := data[8 : 8+dbLen]
+		walData := data[8+dbLen:]
+
+		// Atomic replace
+		tmpPath := dbPath + ".tmp"
+		if err := os.WriteFile(tmpPath, dbData, 0644); err != nil {
+			return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
+		}
+		os.Remove(walPath)
+		os.Remove(dbPath + "-shm")
+		if err := os.Rename(tmpPath, dbPath); err != nil {
+			return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
+		}
+		if len(walData) > 0 {
+			if err := os.WriteFile(walPath, walData, 0644); err != nil {
+				return c.JSON(fiber.Map{"ok": false, "error": err.Error()})
+			}
+		}
+
+		log.Printf("snapshot received: %d bytes db, %d bytes wal", len(dbData), len(walData))
+		return c.JSON(fiber.Map{"ok": true})
+	})
+
+	// GET /health — health check
+	app.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"ok":      true,
+			"db_size": fileSize(dbPath),
+			"wal_size": fileSize(walPath),
+		})
+	})
+
+	log.Printf("replica listening on %s (HTTP/Fiber)", listen)
+	if err := app.Listen(listen); err != nil {
+		log.Fatalf("fiber listen: %v", err)
 	}
-	f.Close()
-
-	log.Printf("WAL received: %d bytes at offset %d", len(chunk.Data), offset)
-	return &pb.Ack{Ok: true, AppliedOffset: offset + int64(len(chunk.Data))}, nil
-}
-
-func (s *replicaServer) Health(ctx context.Context, _ *pb.Empty) (*pb.HealthResponse, error) {
-	return &pb.HealthResponse{
-		Ok:      true,
-		DbSize:  fileSize(s.dbPath),
-		WalSize: fileSize(s.walPath),
-	}, nil
 }
 
 // ============================================================

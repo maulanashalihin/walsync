@@ -8,8 +8,8 @@ Every existing SQLite replication tool forces a tradeoff:
 
 | Tool | Read | Write | Multi-server | Catch |
 |------|-----:|------:|:---:|-------|
-| Native SQLite | 221K QPS | 94K QPS | ❌ | No replication |
-| Litestream | 221K QPS | 94K QPS | ❌ | Backup to S3 only, not live |
+| Native SQLite | 348K QPS | 84K QPS | ❌ | No replication |
+| Litestream | 348K QPS | 84K QPS | ❌ | Backup to S3 only, not live |
 | LiteFS | 220K QPS | 6K QPS | ✅ | FUSE intercepts every write (fsync per write) |
 | Marmot | 16K QPS | 17K QPS | ✅ | TCP server, not embedded (14x slower read) |
 | dqlite | ~50K QPS | ~20K QPS | ✅ | Custom C API, not drop-in SQLite |
@@ -17,8 +17,10 @@ Every existing SQLite replication tool forces a tradeoff:
 **walsync** takes a different approach: the app uses native embedded SQLite (zero overhead), and a separate background process ships WAL changes to replicas asynchronously.
 
 ```
-Result: 221K read QPS + 94K write QPS + live multi-server replication
+Result: 348K read QPS + 84K write QPS + live multi-server replication
 ```
+
+> Benchmark: OVH VPS (6 vCPU Intel Haswell, 11GB RAM, HDD), Bun 1.4.0, SQLite 3.46. Read = point read (`WHERE id = 1`), Write = `INSERT` (WAL mode, `synchronous=NORMAL`). See [full benchmark](#benchmark).
 
 The tradeoff: eventual consistency (~100ms sync delay) and single-writer (primary only).
 

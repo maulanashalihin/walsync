@@ -1,24 +1,7 @@
-# Binaries
-walsync
-walsync-linux-*
-walsync-darwin-*
-walsync-windows-*
-
-# SQLite test files
+/target
+bench/rust/target
+bench/go/walsync-bench-go
 *.db
 *.db-wal
 *.db-shm
-*.db.tmp
-
-# Logs
-*.log
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+*.tmp

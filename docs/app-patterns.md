@@ -451,3 +451,106 @@ All clients below read incremental WAL correctly with persistent readonly connec
 | Ruby sqlite3 | Ruby | ✅ |
 | mattn/go-sqlite3 / modernc.org/sqlite | Go | ✅ |
 | rusqlite | Rust | ✅ |
+
+## Snapshot handling
+
+When the primary's SQLite checkpoints (WAL → DB file), walsync ships a **full snapshot** — the entire DB file is atomically replaced on the replica (`os.Rename`). This changes the DB file's inode. Any persistent app connection that opened the DB before the snapshot now points to the old (deleted) file descriptor and reads **stale data forever**.
+
+### When does checkpoint happen?
+
+- Primary app closes its last database connection (e.g. app restart)
+- Primary app explicitly runs `PRAGMA wal_checkpoint`
+- SQLite auto-checkpoint reaches threshold (disabled if `wal_autocheckpoint = 0`)
+- `sqlite3` CLI is used on the primary DB (each CLI exit = checkpoint)
+
+### How to handle: auto-reconnect on error
+
+```javascript
+const Database = require('better-sqlite3');
+
+let readDb = null;
+
+function getReadDb() {
+  if (!readDb) {
+    readDb = new Database(DB_PATH, { readonly: true });
+  }
+  return readDb;
+}
+
+function readQuery(sql, ...params) {
+  try {
+    return getReadDb().prepare(sql).all(...params);
+  } catch (err) {
+    // SQLite error codes that indicate stale file handle:
+    // SQLITE_IOERR (10), SQLITE_NOTADB (26), SQLITE_CANTOPEN (14)
+    if (err.code === 'SQLITE_IOERR' || err.code === 'SQLITE_NOTADB' || err.code === 'SQLITE_CANTOPEN') {
+      console.log('Replica DB replaced (snapshot), reconnecting...');
+      readDb = null;  // force reopen on next call
+      return readQuery(sql, ...params);  // retry once
+    }
+    throw err;
+  }
+}
+```
+
+### How to handle: periodic reconnect
+
+Simpler approach — reopen connection every N seconds. No error detection needed, but adds slight overhead.
+
+```javascript
+let readDb = new Database(DB_PATH, { readonly: true });
+
+// Reopen every 60 seconds to pick up snapshots
+setInterval(() => {
+  readDb.close();
+  readDb = new Database(DB_PATH, { readonly: true });
+}, 60_000);
+```
+
+### Which approach?
+
+- **Auto-reconnect on error** — Zero overhead, handles snapshot immediately. Recommended for most apps.
+- **Periodic reconnect** — Simpler, but reads may be stale for up to N seconds after snapshot. Fine for analytics/dashboards.
+
+## WAL growth management
+
+Replica readonly connections never checkpoint. The WAL file grows indefinitely as walsync ships more data. Over weeks/months, WAL can reach GB.
+
+### Monitoring
+
+```bash
+# Check WAL size via walsync health endpoint
+curl -s http://replica:9193/health | jq .wal_size
+
+# Alert if WAL > 100MB
+WAL_SIZE=$(curl -s http://replica:9193/health | jq .wal_size)
+if [ "$WAL_SIZE" -gt 104857600 ]; then
+  echo "ALERT: Replica WAL exceeds 100MB"
+fi
+```
+
+### Manual checkpoint (safe)
+
+To checkpoint the replica WAL (merge WAL into DB, truncate WAL):
+
+```bash
+# 1. Stop walsync replica
+systemctl stop walsync-replica
+
+# 2. Checkpoint (requires write connection, so no app should be reading)
+sqlite3 /data/app.db "PRAGMA wal_checkpoint(TRUNCATE);"
+
+# 3. Start walsync replica
+systemctl start walsync-replica
+```
+
+**Important:** Checkpoint requires a brief write window. Apps with readonly connections open will block the checkpoint. Stop apps OR stop walsync and ensure no connections are open before checkpointing.
+
+### Primary-side: prevent unnecessary checkpoints
+
+Every primary checkpoint = full snapshot to all replicas. To minimize:
+
+- Set `PRAGMA wal_autocheckpoint = 0` on primary app
+- Keep primary app connection persistent (don't close/reopen)
+- Never use `sqlite3` CLI on the primary DB in production
+- If WAL grows too large on primary, schedule a maintenance window: stop app, let walsync ship final WAL, checkpoint, restart

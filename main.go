@@ -10,9 +10,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -247,6 +249,10 @@ func runPrimary(dbPath string, replicasCSV string) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
+	// Graceful shutdown on SIGTERM/SIGINT
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
 	for {
 		select {
 		case event, ok := <-watcher.Events:
@@ -307,6 +313,9 @@ func runPrimary(dbPath string, replicasCSV string) {
 				return
 			}
 			log.Printf("watcher error: %v", err)
+		case <-sigCh:
+			log.Println("primary shutting down (SIGTERM/SIGINT)")
+			return
 		}
 	}
 }
@@ -580,6 +589,16 @@ func runReplica(dbPath string, listen string) {
 	})
 
 	log.Printf("replica listening on %s (HTTP/Fiber)", listen)
+
+	// Graceful shutdown on SIGTERM/SIGINT
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Println("replica shutting down (SIGTERM/SIGINT)")
+		_ = app.Shutdown()
+	}()
+
 	if err := app.Listen(listen); err != nil {
 		log.Fatalf("fiber listen: %v", err)
 	}

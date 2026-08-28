@@ -290,6 +290,7 @@ Use `readonly: true` to prevent checkpoint on close (WAL preserved for next incr
 - [x] ~~gRPC → Fiber (fasthttp) transport~~ — Shipped in v0.6.0 (1.7-2.1x faster, 24% smaller binary)
 - [x] ~~WAL visibility fix (-shm removal)~~ — Shipped in v0.7.0 (incremental WAL now visible to all SQLite clients)
 - [x] ~~WAL visibility fix (-shm corruption)~~ — Shipped in v0.8.0 (persistent readonly connections now see incremental WAL via mmap)
+- [x] ~~Graceful shutdown + production hardening~~ — Shipped in v1.0.0 (SIGTERM/SIGINT, production checklist, snapshot auto-reconnect, WAL growth docs)
 
 ## Benchmark
 
@@ -333,9 +334,38 @@ walsync achieves native SQLite speed because:
 See [`examples/`](examples/) for sample apps:
 - `writer-app.js` — Persistent writer (Node.js, keeps DB connection open)
 - `reader-app.js` — Read-only app (Node.js, reads from replica)
-- `app-patterns/server.js` — Express app with role-based read/write split (primary writes, replica reads with fresh readonly per request)
+- `app-patterns/server.js` — Express app with role-based read/write split + auto-reconnect on snapshot
 
 See [`docs/app-patterns.md`](docs/app-patterns.md) for architecture patterns and read-after-write strategies.
+
+## Production checklist
+
+Before deploying walsync to production, verify each item below. Skipping any of these will cause data staleness, corruption, or excessive snapshots.
+
+### Primary app (writer)
+
+- [ ] **Set `PRAGMA journal_mode = WAL`** — Required for WAL shipping. Without WAL mode, walsync has nothing to ship.
+- [ ] **Set `PRAGMA wal_autocheckpoint = 0`** — Disable auto-checkpoint. Every checkpoint triggers a full snapshot (expensive). Let walsync manage WAL lifecycle.
+- [ ] **Use persistent connection for writes** — Opening/closing connections triggers checkpoints. Keep one connection open for all writes.
+- [ ] **Do NOT use `sqlite3` CLI for writes in production** — CLI closes connection after each command → checkpoint → snapshot cascade. Use an app with a persistent connection.
+
+### Replica app (reader)
+
+- [ ] **Use `readonly: true` connections** — Closing a readwrite connection triggers checkpoint → WAL truncated → next incremental WAL ship writes to empty WAL at wrong offset → **WAL invalid**. Readonly connections do NOT checkpoint on close.
+- [ ] **Handle stale reads after snapshot** — When primary checkpoints, walsync ships a full snapshot (atomic DB file replace). Your app's persistent connection now points to the old (deleted) DB file. **Reopen connections after snapshot.** See [app patterns — snapshot handling](docs/app-patterns.md#snapshot-handling).
+- [ ] **Do NOT write to replica DB** — Replica is read-only. Writes will conflict with walsync's WAL writes and cause corruption.
+
+### walsync process
+
+- [ ] **Firewall between nodes** — walsync has no auth (by design). Restrict replica port to primary IP only. See [deploy/README.md](deploy/README.md#firewall-required-before-production).
+- [ ] **Run as systemd service** — systemd handles restart, logs, and graceful shutdown (SIGTERM). See [deploy/](deploy/).
+- [ ] **Monitor WAL file size on replica** — Readonly connections never checkpoint. WAL grows indefinitely. Set up a cron job or monitoring alert. See [WAL growth management](docs/app-patterns.md#wal-growth-management).
+- [ ] **Monitor `/health` endpoint** — `GET http://replica:9193/health` returns `db_size` and `wal_size`. Alert if `wal_size` exceeds threshold (e.g. 100MB).
+
+### Network
+
+- [ ] **Low latency between nodes** — Sync delay = ~100ms + network RTT. Same datacenter recommended. Cross-region adds 50-200ms.
+- [ ] **Dedicated port** — Use a port not shared with other services. Default: 9090 (configurable via `-listen`).
 
 ## Contributing
 

@@ -1,6 +1,6 @@
 # walsync
 
-Live SQLite WAL shipping replication. Write to local SQLite at native speed, sync to replica servers automatically via gRPC.
+Live SQLite WAL shipping replication. Write to local SQLite at native speed, sync to replica servers automatically via HTTP.
 
 ## Why?
 
@@ -34,7 +34,7 @@ The tradeoff: eventual consistency (~1-2s sync delay) and single-writer (primary
 │    app.db + app.db-wal      │       │    replica.db + .db-wal     │
 │         │                   │       │         ▲                   │
 │    ┌────┴────┐              │       │    ┌────┴────┐              │
-│    │ walsync │ ── gRPC ─────┼───────┼───→│ walsync │              │
+│    │ walsync │ ── HTTP ─────┼───────┼───→│ walsync │              │
 │    │ primary │  WAL ship    │       │    │ replica │              │
 │    └─────────┘              │       │    └─────────┘              │
 └─────────────────────────────┘       └─────────────────────────────┘
@@ -42,7 +42,7 @@ The tradeoff: eventual consistency (~1-2s sync delay) and single-writer (primary
 
 1. App writes to local SQLite (embedded, native speed)
 2. walsync watches WAL file changes (fsnotify + polling)
-3. walsync ships WAL data to replicas via gRPC (persistent HTTP/2, gzip compressed)
+3. walsync ships WAL data to replicas via HTTP (persistent connections, gzip compressed)
 4. Replica receives WAL, writes to local SQLite
 5. App on replica reads from local SQLite (embedded, native speed)
 
@@ -61,7 +61,7 @@ chmod +x walsync
 #   walsync-linux-arm64   (Linux ARM64)
 ```
 
-Or build from source (requires Go 1.22+):
+Or build from source (requires Go 1.26+):
 
 ```bash
 git clone https://github.com/maulanashalihin/walsync.git
@@ -75,7 +75,7 @@ go build -o walsync .
 ./walsync -mode replica -db /data/app.db -listen :9090
 ```
 
-This starts a gRPC server on port 9090 that receives WAL data from primary.
+This starts an HTTP server on port 9090 that receives WAL data from primary.
 
 ### 3. Start primary (Node 1)
 
@@ -184,7 +184,7 @@ docker run -d --name walsync-primary \
 
 ### Firewall
 
-Replica listens on port 9090 (gRPC). Restrict to primary IPs:
+Replica listens on port 9090 (HTTP). Restrict to primary IPs:
 
 ```bash
 # UFW (Ubuntu/Debian)
@@ -207,7 +207,7 @@ Primary mode:
 Replica mode:
   -mode replica
   -db <path>              SQLite database file path
-  -listen <addr>          gRPC listen address (default :9090)
+  -listen <addr>          HTTP listen address (default :9090)
 
 Examples:
   walsync -mode replica -db /data/app.db -listen :9090
@@ -217,7 +217,7 @@ Examples:
 ## Features
 
 - **Embedded SQLite on both sides** — App reads/writes at native SQLite speed (221K read QPS, 94K write QPS)
-- **gRPC transport** — Persistent HTTP/2 connection, no TCP handshake per sync
+- **HTTP transport (Fiber/fasthttp)** — Persistent connections, gzip compressed, 1.7-2.1x faster than gRPC
 - **gzip compression** — 95% bandwidth reduction (SQLite pages compress extremely well)
 - **Keepalive** — Connection failure detected in ~15s (ping every 10s)
 - **Automatic sync** — walsync detects WAL changes and ships to replicas in background
@@ -231,16 +231,17 @@ Examples:
 - **Single-writer** — Only primary accepts writes. Replicas are read-only.
 - **No failover** — No automatic primary promotion. Manual failover only.
 - **Eventual consistency** — Sync delay ~1-2 seconds depending on network.
-- **No auth** — gRPC endpoints are unauthenticated. Use behind VPN/firewall.
+- **No auth** — HTTP endpoints are unauthenticated. Use behind VPN/firewall.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
 
 ### Roadmap
 
-- [ ] WAL frame-level incremental shipping — avoid full snapshot on checkpoint ([#3](https://github.com/maulanashalihin/walsync/issues/3))
+- [x] ~~WAL frame-level incremental shipping~~ — Not viable (checkpoint modifies untracked pages, causes corruption)
 - [ ] TLS + token authentication
 - [ ] Automatic failover (promote replica on primary failure)
 - [ ] Multi-primary with conflict resolution (LWW or CRDT)
-- [ ] Prometheus metrics endpoint
+- [x] ~~Prometheus metrics endpoint~~ — Shipped in v0.5.0
+- [x] ~~gRPC → Fiber (fasthttp) transport~~ — Shipped in v0.6.0 (1.7-2.1x faster, 24% smaller binary)
 
 ## Benchmark
 

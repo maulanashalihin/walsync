@@ -30,7 +30,7 @@ func main() {
 	mode := flag.String("mode", "", "primary or replica")
 	dbPath := flag.String("db", "", "path to SQLite database file")
 	replicas := flag.String("replicas", "", "comma-separated replica addresses (primary mode, e.g. host:port)")
-	listen := flag.String("listen", ":9090", "gRPC listen address (replica mode)")
+	listen := flag.String("listen", ":9090", "HTTP listen address (replica mode)")
 	metricsAddr := flag.String("metrics", "", "HTTP metrics listen address (e.g. :9091, empty = disabled)")
 	configPath := flag.String("config", "", "path to TOML config file (CLI flags override config)")
 	flag.Parse()

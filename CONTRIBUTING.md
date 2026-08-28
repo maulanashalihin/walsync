@@ -72,7 +72,7 @@ Deploy `walsync-linux-amd64` to two servers:
 ## Roadmap areas
 
 - **~~WAL frame-level shipping~~** — Researched, not viable (checkpoint modifies untracked pages)
-- **TLS + auth** — secure the HTTP transport
+- **~~TLS + auth~~** — Not pursuing. Firewall is zero-overhead, kernel-level. TLS adds per-request encrypt/decrypt. Use firewall/VPN.
 - **Automatic failover** — health checks + replica promotion
 - **~~gRPC transport~~** — Replaced with Fiber (fasthttp) in v0.6.0, 1.7-2.1x faster
 - **~~Multi-primary~~** — Researched, not pursuing (market crowded: Marmot, cr-sqlite, rqlite, dqlite, LiteFS, Turso)

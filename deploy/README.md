@@ -44,7 +44,29 @@ sudo systemctl enable --now walsync-replica
 # Check status
 sudo systemctl status walsync-replica
 sudo journalctl -u walsync-replica -f
+
+### 3.5. Firewall — REQUIRED before verify
+
+walsync has no auth by design. **You MUST restrict replica port to primary IPs only.** An exposed replica port lets anyone write arbitrary WAL data to your database.
+
+```bash
+# UFW (Ubuntu/Debian) — replace PRIMARY_IP with your primary server's IP
+sudo ufw allow from PRIMARY_IP to any port 9090
+sudo ufw deny 9090
+sudo ufw enable
+
+# Verify: only PRIMARY_IP should have access
+sudo ufw status numbered | grep 9090
 ```
+
+```bash
+# iptables (any Linux)
+sudo iptables -A INPUT -p tcp --dport 9090 -s PRIMARY_IP -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 9090 -j DROP
+# Persist: sudo apt install iptables-persistent && sudo netfilter-persistent save
+```
+
+**Why firewall, not TLS/auth?** Firewall = kernel-level, zero app overhead, already in your OS. TLS = handshake + encrypt/decrypt per WAL ship. Token auth = per-request validation. For trusted server-to-server WAL shipping, firewall is the right tool.
 
 ### 4. Verify
 
@@ -73,20 +95,6 @@ The service files include:
   - `PrivateTmp` — isolated /tmp
   - `ReadWritePaths` — only /var/lib/walsync writable
 - **Journal logging** — `journalctl -u walsync-primary -f`
-
-## Firewall
-
-Replica listens on port 9090 (HTTP). Restrict to primary IPs only:
-
-```bash
-# UFW (Ubuntu/Debian)
-sudo ufw allow from PRIMARY_IP to any port 9090
-sudo ufw deny 9090
-
-# iptables
-sudo iptables -A INPUT -p tcp --dport 9090 -s PRIMARY_IP -j ACCEPT
-sudo iptables -A INPUT -p tcp --dport 9090 -j DROP
-```
 
 ## Docker
 

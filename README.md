@@ -182,15 +182,28 @@ docker run -d --name walsync-primary \
   walsync -mode primary -db /var/lib/walsync/app.db -replicas replica-host:9090
 ```
 
-### Firewall
+### Firewall — REQUIRED before production
 
-Replica listens on port 9090 (HTTP). Restrict to primary IPs:
+walsync has no auth by design (zero overhead). **You MUST restrict replica port to primary IPs only** before going to production. An exposed replica port lets anyone write arbitrary WAL data to your database.
 
 ```bash
-# UFW (Ubuntu/Debian)
+# UFW (Ubuntu/Debian) — replace PRIMARY_IP with your primary server's IP
 sudo ufw allow from PRIMARY_IP to any port 9090
 sudo ufw deny 9090
+sudo ufw enable
+
+# Verify: only PRIMARY_IP should have access
+sudo ufw status numbered | grep 9090
 ```
+
+```bash
+# iptables (any Linux)
+sudo iptables -A INPUT -p tcp --dport 9090 -s PRIMARY_IP -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 9090 -j DROP
+# Persist: sudo apt install iptables-persistent && sudo netfilter-persistent save
+```
+
+**Why firewall, not TLS/auth?** Firewall = kernel-level, zero app overhead, already in your OS. TLS = handshake + encrypt/decrypt per WAL ship. Token auth = per-request validation. For trusted server-to-server WAL shipping, firewall is the right tool.
 
 See [deploy/README.md](deploy/README.md) for complete production guide (operations, log rotation, updates, multi-replica setup).
 
@@ -231,13 +244,13 @@ Examples:
 - **Single-writer** — Only primary accepts writes. Replicas are read-only.
 - **No failover** — No automatic primary promotion. Manual failover only.
 - **Eventual consistency** — Sync delay ~100ms median (measured: 33-210ms, 2 Singapore VPS, ~20ms RTT)
-- **No auth** — HTTP endpoints are unauthenticated. Use behind VPN/firewall.
+- **No auth (by design)** — HTTP endpoints are unauthenticated. Security is handled at network layer (firewall/VPN), not application layer. Zero overhead.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
 
 ### Roadmap
 
 - [x] ~~WAL frame-level incremental shipping~~ — Not viable (checkpoint modifies untracked pages, causes corruption)
-- [ ] TLS + token authentication
+- [x] ~~TLS + token authentication~~ — Not pursuing. Firewall is zero-overhead, kernel-level. TLS adds handshake + encrypt/decrypt per request. IP verification adds per-connection check. Use firewall/VPN instead.
 - [ ] Automatic failover (promote replica on primary failure)
 - [x] ~~Multi-primary with conflict resolution~~ — Researched, not pursuing (market crowded: Marmot, cr-sqlite, rqlite, dqlite, LiteFS, Turso)
 - [x] ~~Prometheus metrics endpoint~~ — Shipped in v0.5.0

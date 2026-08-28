@@ -1,0 +1,15 @@
+{
+  "name": "walsync-app-patterns",
+  "version": "1.0.0",
+  "description": "Example app: single-writer + multi-read with walsync",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "primary": "WALSYNC_ROLE=primary DB_PATH=/tmp/walsync-app-primary.db node server.js",
+    "replica": "WALSYNC_ROLE=replica PRIMARY_URL=http://localhost:3000 DB_PATH=/tmp/walsync-app-replica.db node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "express": "^4.21.0"
+  }
+}

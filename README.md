@@ -335,7 +335,7 @@ walsync does not intercept app I/O. App reads/writes directly to embedded SQLite
 
 ### Head-to-head: walsync vs cr-sqlite (2 VPS, cross-region, end-to-end from client)
 
-Benchmarked from Mac M4 over public internet to 2 VPS (OVH 51.79.159.231 + underconst 185.111.159.99, ~35-40ms RTT client→server, ~7-35ms RTT server↔server). Bun 1.4.0, SQLite 3.46, walsync v1.1.0, cr-sqlite v0.16.3. 100 requests per test.
+Benchmarked from Mac M4 over public internet to 2 VPS (OVH + underconst, ~35-40ms RTT client→server, ~7-35ms RTT server↔server). Bun 1.4.0, SQLite 3.46, walsync v1.1.0, cr-sqlite v0.16.3. 100 requests per test.
 
 | Metric | walsync v1.1.0 | cr-sqlite v0.16.3 | Winner |
 |--------|--------:|----------:|:------:|

@@ -1,0 +1,59 @@
+name: Compatibility Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "main.go"
+      - "go.mod"
+      - "compat/**"
+      - ".github/workflows/compat.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "main.go"
+      - "go.mod"
+      - "compat/**"
+      - ".github/workflows/compat.yml"
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build walsync binary
+        run: |
+          CGO_ENABLED=0 go build -o compat/walsync .
+          chmod +x compat/walsync
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install better-sqlite3
+        run: |
+          cd compat
+          npm install better-sqlite3
+
+      - name: Install PHP + Ruby + Python
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq php-cli php-sqlite3 ruby ruby-dev libsqlite3-dev
+          sudo gem install sqlite3 --no-document
+
+      - name: Run compatibility tests
+        run: bash compat/run-all.sh

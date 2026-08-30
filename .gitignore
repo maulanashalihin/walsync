@@ -22,3 +22,9 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+compat/walsync
+compat/node_modules/
+compat/*.db
+compat/*.db-*
+compat/*.log
+compat/test-go-runner.go

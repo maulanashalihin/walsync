@@ -333,6 +333,28 @@ walsync does not intercept app I/O. App reads/writes directly to embedded SQLite
 
 > Read QPS = point read (`WHERE id = 1`). walsync = native SQLite speed because app uses embedded SQLite directly (no FUSE, no TCP, no interceptor). LiteFS read is fast (FUSE cache) but write is 14x slower (FUSE overhead). Marmot/PostgreSQL go through TCP = inherent latency.
 
+### Head-to-head: walsync vs cr-sqlite (2 VPS, cross-region, end-to-end from client)
+
+Benchmarked from Mac M4 over public internet to 2 VPS (OVH 51.79.159.231 + underconst 185.111.159.99, ~35-40ms RTT client→server, ~7-35ms RTT server↔server). Bun 1.4.0, SQLite 3.46, walsync v1.1.0, cr-sqlite v0.16.3. 100 requests per test.
+
+| Metric | walsync v1.1.0 | cr-sqlite v0.16.3 | Winner |
+|--------|--------:|----------:|:------:|
+| Write latency p50 (OVH) | 35.7ms | 37.8ms | walsync |
+| Read latency p50 (OVH) | 35.7ms | 35.3ms | Tie |
+| Read latency p50 (replica) | 39.5ms | 40.6ms | Tie |
+| **Sync delay p50 (burst 20)** | 4742ms | **165ms** | **cr-sqlite (29x)** |
+| **Write throughput (single node)** | **965 QPS** | 365 QPS | **walsync (2.6x)** |
+| Read throughput (replica) | 139 QPS | 162 QPS | cr-sqlite (1.2x) |
+| Multi-writer | ❌ (primary only) | ✅ (both nodes) | cr-sqlite |
+
+**Why walsync wins write throughput:** App uses native SQLite insert (zero overhead). cr-sqlite adds trigger overhead per CRR table (2.5x slower inserts, documented in cr-sqlite README).
+
+**Why cr-sqlite wins burst sync delay:** cr-sqlite polls every 50ms and ships row-level changes immediately. walsync debounces 50ms then ships WAL page-level batches — 20 burst writes stack up before shipping.
+
+**When to pick walsync:** Write-heavy single-writer apps (web app pattern: write to primary, read from replica). 2.6x higher write throughput, zero app overhead, single binary.
+
+**When to pick cr-sqlite:** Multi-writer or low burst sync delay required. Write on any node, CRDT conflict resolution, 29x faster burst sync.
+
 ## Examples
 
 See [`examples/`](examples/) for sample apps:

@@ -22,8 +22,8 @@ count = db.get_first_value("SELECT COUNT(*) FROM items")
 puts "  read 2 OK (persistent conn): count = #{count}"
 
 row = db.get_first_row("SELECT * FROM items WHERE id = 1")
-if !row || row[1] != "test-row-1" then puts "FAIL: point read mismatch #{row}"; exit 1 end
-puts "  read 3 OK (point read): #{row[1]}"
+if !row || row["name"] != "test-row-1" then puts "FAIL: point read mismatch #{row}"; exit 1 end
+puts "  read 3 OK (point read): #{row["name"]}"
 
 db.close
 puts "PASS: Ruby sqlite3 — data correct, persistent connection works"

@@ -5,8 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== Test: better-sqlite3 (persistent readonly) ==="
 bash "$SCRIPT_DIR/setup.sh"
-
-node -e '
+NODE_PATH="$SCRIPT_DIR/node_modules" node -e '
 const Database = require("better-sqlite3");
 const dbPath = process.argv[1];
 const db = new Database(dbPath, { readonly: true });

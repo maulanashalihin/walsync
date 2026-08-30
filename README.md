@@ -22,7 +22,7 @@ Every existing SQLite replication tool forces a tradeoff:
 Result: 348K read QPS + 84K write QPS + live multi-server replication
 ```
 
-> Benchmark: OVH VPS (6 vCPU Intel Haswell, 11GB RAM, HDD), Bun 1.4.0, SQLite 3.46. Read = point read (`WHERE id = 1`), Write = `INSERT` (WAL mode, `synchronous=NORMAL`). See [full benchmark](#benchmark).
+> Benchmark: VPS (6 vCPU Intel Haswell, 11GB RAM, HDD), Bun 1.4.0, SQLite 3.46. Read = point read (`WHERE id = 1`), Write = `INSERT` (WAL mode, `synchronous=NORMAL`). See [full benchmark](#benchmark).
 
 The tradeoff: eventual consistency (~100ms sync delay) and single-writer (primary only).
 
@@ -308,7 +308,7 @@ Use `readonly: true` to prevent checkpoint on close (WAL preserved for next incr
 
 walsync does not intercept app I/O. App reads/writes directly to embedded SQLite. walsync runs as a separate background process. Numbers below are pure SQLite speed.
 
-**Benchmarked on OVH VPS** (6 vCPU Intel Haswell, 11GB RAM, 100GB HDD, Ubuntu 26.04, Bun 1.4.0, SQLite 3.46):
+**Benchmarked on VPS** (6 vCPU Intel Haswell, 11GB RAM, 100GB HDD, Ubuntu 26.04, Bun 1.4.0, SQLite 3.46):
 
 | Query | QPS | Notes |
 |-------|---:|-------|
@@ -320,7 +320,7 @@ walsync does not intercept app I/O. App reads/writes directly to embedded SQLite
 
 > QPS depends heavily on query type. Point reads > range reads. Small rows > large rows. `ORDER BY` is expensive. Your mileage will vary.
 
-### Tool comparison (same OVH VPS, localhost)
+### Tool comparison (same VPS, localhost)
 
 | Tool | Read QPS | Write QPS | Model | Multi-server |
 |------|--------:|--------:|-------|:---:|
@@ -335,12 +335,12 @@ walsync does not intercept app I/O. App reads/writes directly to embedded SQLite
 
 ### Head-to-head: walsync vs cr-sqlite (2 VPS, cross-region, end-to-end from client)
 
-Benchmarked from Mac M4 over public internet to 2 VPS (OVH + underconst, ~35-40ms RTT client→server, ~7-35ms RTT server↔server). Bun 1.4.0, SQLite 3.46, walsync v1.1.0, cr-sqlite v0.16.3. 100 requests per test.
+Benchmarked from Mac M4 over public internet to 2 VPS (Server A + Server B, ~35-40ms RTT client→server, ~7-35ms RTT server↔server). Bun 1.4.0, SQLite 3.46, walsync v1.1.0, cr-sqlite v0.16.3. 100 requests per test.
 
 | Metric | walsync v1.1.0 | cr-sqlite v0.16.3 | Winner |
 |--------|--------:|----------:|:------:|
-| Write latency p50 (OVH) | 35.7ms | 37.8ms | walsync |
-| Read latency p50 (OVH) | 35.7ms | 35.3ms | Tie |
+| Write latency p50 (Server A) | 35.7ms | 37.8ms | walsync |
+| Read latency p50 (Server A) | 35.7ms | 35.3ms | Tie |
 | Read latency p50 (replica) | 39.5ms | 40.6ms | Tie |
 | **Sync delay p50 (burst 20)** | 4742ms | **165ms** | **cr-sqlite (29x)** |
 | **Write throughput (single node)** | **965 QPS** | 365 QPS | **walsync (2.6x)** |

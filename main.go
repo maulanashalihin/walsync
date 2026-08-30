@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -305,7 +306,7 @@ func runPrimary(dbPath string, replicasCSV string) {
 			if currentSize <= lastShippedSize {
 				continue
 			}
-			shipWALHTTP(walPath, lastShippedSize, currentSize, conns)
+			shipWALHTTP(dbPath, walPath, lastShippedSize, currentSize, conns)
 			lastShippedSize = currentSize
 
 		case err, ok := <-watcher.Errors:
@@ -400,7 +401,7 @@ func shipSnapshotHTTP(dbPath, walPath string, conns []*replicaConn) {
 
 // shipWALHTTP ships incremental WAL bytes to all replicas via HTTP.
 // Body: gzip-compressed WAL bytes from offset.
-func shipWALHTTP(walPath string, offset, size int64, conns []*replicaConn) {
+func shipWALHTTP(dbPath, walPath string, offset, size int64, conns []*replicaConn) {
 	f, err := os.Open(walPath)
 	if err != nil {
 		log.Printf("error opening wal file: %v", err)
@@ -433,6 +434,9 @@ func shipWALHTTP(walPath string, offset, size int64, conns []*replicaConn) {
 	compressed := buf.Bytes()
 
 	offsetStr := strconv.FormatInt(offset, 10)
+	salt1, salt2 := walSalt(walPath)
+	salt1Str := strconv.FormatUint(uint64(salt1), 10)
+	salt2Str := strconv.FormatUint(uint64(salt2), 10)
 
 	var wg sync.WaitGroup
 	for _, rc := range conns {
@@ -451,6 +455,8 @@ func shipWALHTTP(walPath string, offset, size int64, conns []*replicaConn) {
 			req.Header.Set("Content-Type", "application/octet-stream")
 			req.Header.Set("Content-Encoding", "gzip")
 			req.Header.Set("X-Walsync-Offset", offsetStr)
+			req.Header.Set("X-Walsync-Salt1", salt1Str)
+			req.Header.Set("X-Walsync-Salt2", salt2Str)
 			req.SetBody(compressed)
 
 			if err := rc.client.DoTimeout(req, res, 5*time.Second); err != nil {
@@ -463,6 +469,8 @@ func shipWALHTTP(walPath string, offset, size int64, conns []*replicaConn) {
 				req.Header.Set("Content-Type", "application/octet-stream")
 				req.Header.Set("Content-Encoding", "gzip")
 				req.Header.Set("X-Walsync-Offset", offsetStr)
+			req.Header.Set("X-Walsync-Salt1", salt1Str)
+			req.Header.Set("X-Walsync-Salt2", salt2Str)
 				req.SetBody(compressed)
 				if err := rc.client.DoTimeout(req, res, 5*time.Second); err != nil {
 					log.Printf("retry wal ship to %s failed: %v", rc.addr, err)
@@ -472,8 +480,14 @@ func shipWALHTTP(walPath string, offset, size int64, conns []*replicaConn) {
 			}
 
 			if res.StatusCode() != 200 {
-				log.Printf("wal ship to %s failed: HTTP %d", rc.addr, res.StatusCode())
+				body := string(res.Body())
+				log.Printf("wal ship to %s failed: HTTP %d: %s", rc.addr, res.StatusCode(), body)
 				metricsIncWalError()
+				// Replica rejected WAL (salt mismatch, truncated, etc.) → ship snapshot
+				if strings.Contains(body, "snapshot") {
+					log.Printf("replica %s requested snapshot, shipping...", rc.addr)
+					shipSnapshotHTTP(dbPath, walPath, []*replicaConn{rc})
+				}
 			}
 		}(rc)
 	}
@@ -511,8 +525,34 @@ func runReplica(dbPath string, listen string) {
 			return c.JSON(fiber.Map{"ok": false, "error": "DB file does not exist, send snapshot first"})
 		}
 
+	offset, _ := strconv.ParseInt(string(c.Get("X-Walsync-Offset")), 10, 64)
 
-		offset, _ := strconv.ParseInt(string(c.Get("X-Walsync-Offset")), 10, 64)
+	// Validate WAL salt: if replica's WAL has different salt than primary's,
+	// the WAL was recreated (checkpoint, CLI access, etc.). Reject and force
+	// primary to ship a fresh snapshot. Writing WAL data at an offset into
+	// a WAL with different salt = silent corruption.
+	primarySalt1, _ := strconv.ParseUint(string(c.Get("X-Walsync-Salt1")), 10, 32)
+	primarySalt2, _ := strconv.ParseUint(string(c.Get("X-Walsync-Salt2")), 10, 32)
+	if primarySalt1 != 0 { // primary sends salt (v1.1.0+)
+		replicaSalt1, replicaSalt2 := walSalt(walPath)
+		if replicaSalt1 != 0 { // replica has existing WAL
+			if replicaSalt1 != uint32(primarySalt1) || replicaSalt2 != uint32(primarySalt2) {
+				log.Printf("WAL rejected: salt mismatch (primary=%d/%d, replica=%d/%d), requesting snapshot",
+					primarySalt1, primarySalt2, replicaSalt1, replicaSalt2)
+				return c.JSON(fiber.Map{"ok": false, "error": "WAL salt mismatch, send snapshot"})
+			}
+		}
+		// Also reject if offset > 0 but WAL file is smaller than offset
+		// (WAL was truncated by a checkpoint on replica side)
+		if offset > 0 {
+			if walSize := fileSize(walPath); walSize < offset {
+				log.Printf("WAL rejected: offset %d beyond WAL size %d, requesting snapshot", offset, walSize)
+				return c.JSON(fiber.Map{"ok": false, "error": "WAL truncated, send snapshot"})
+			}
+		}
+	}
+
+
 
 		var f *os.File
 		var err error
@@ -613,22 +653,31 @@ func runReplica(dbPath string, listen string) {
 	}
 }
 
-// invalidateShm corrupts the -shm file by flipping the first byte.
+// invalidateShm corrupts the -shm file by flipping the first byte in-place.
 // SQLite detects the invalid checksum on next query, rebuilds the WAL
 // index from the WAL file, and writes the valid index back to the same
 // file (same inode). This allows persistent app connections to see new
 // WAL frames via mmap shared memory. If -shm doesn't exist, this is a
 // no-op (fresh connections will rebuild it on open).
+//
+// IMPORTANT: Must use in-place write (OpenFile O_WRONLY + WriteAt byte 0).
+// os.WriteFile truncates the file first, which invalidates mmap'd pages
+// in processes that have -shm mapped (e.g. bun:sqlite) → SIGBUS crash.
+// In-place write only changes byte 0; mmap coherence handles the rest.
 func invalidateShm(dbPath string) {
 	shmPath := dbPath + "-shm"
-	data, err := os.ReadFile(shmPath)
-	if err != nil || len(data) == 0 {
+	f, err := os.OpenFile(shmPath, os.O_WRONLY, 0644)
+	if err != nil {
 		return
 	}
-	data[0] ^= 0xFF
-	os.WriteFile(shmPath, data, 0644)
+	defer f.Close()
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], 0); err != nil {
+		return
+	}
+	b[0] ^= 0xFF
+	f.WriteAt(b[:], 0)
 }
-
 // ============================================================
 // UTILITIES
 // ============================================================

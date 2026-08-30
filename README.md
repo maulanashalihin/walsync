@@ -2,6 +2,14 @@
 
 [![Compatibility Tests](https://github.com/maulanashalihin/walsync/actions/workflows/compat.yml/badge.svg)](https://github.com/maulanashalihin/walsync/actions/workflows/compat.yml)
 
+> **⚠️ ARCHIVED — This project is no longer maintained.**
+>
+> WAL page-level shipping has a fundamental flaw: burst writes produce WAL frames that don't match replica DB page layout, causing silent data loss. Row 1 syncs (via snapshot), but rows 2-5 from burst writes never appear on replica. This cannot be patched — it's inherent to file-level WAL shipping.
+>
+> **Use [cr-sqlite](https://github.com/tursodatabase/cr-sqlite) instead.** It works at row-level (trigger + SQL), not file-level (WAL bytes), so it's immune to page layout mismatch. Benchmark showed cr-sqlite has 29x faster burst sync delay (165ms vs 4742ms) and reliable multi-writer replication.
+>
+> What's still valuable here: compat test suite (`compat/`), benchmark methodology, and SQLite WAL internals learnings.
+
 Live SQLite WAL shipping replication. Write to local SQLite at native speed, sync to replica servers automatically via HTTP.
 
 ## Why?

@@ -1,5 +1,7 @@
 # walsync
 
+[![Compatibility Tests](https://github.com/maulanashalihin/walsync/actions/workflows/compat.yml/badge.svg)](https://github.com/maulanashalihin/walsync/actions/workflows/compat.yml)
+
 Live SQLite WAL shipping replication. Write to local SQLite at native speed, sync to replica servers automatically via HTTP.
 
 ## Why?

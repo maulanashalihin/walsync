@@ -52,15 +52,14 @@ The tradeoff: eventual consistency (~100ms sync delay) and single-writer (primar
 
 ### 1. Download binary
 
+> **⚠️ Minimum version: v1.1.0.** v1.0.0 has a SIGBUS crash in `bun:sqlite` (truncated `-shm` file) and silent data corruption on checkpoint (no WAL salt validation). Always use v1.1.0 or later.
+
 ```bash
 # Linux x86_64
-curl -L https://github.com/maulanashalihin/walsync/releases/latest/download/walsync-linux-amd64 -o walsync
+curl -L https://github.com/maulanashalihin/walsync/releases/download/v1.1.0/walsync-linux-amd64-fixed -o walsync
 chmod +x walsync
 
-# Other platforms: replace walsync-linux-amd64 with:
-#   walsync-darwin-arm64  (macOS Apple Silicon)
-#   walsync-darwin-amd64  (macOS Intel)
-#   walsync-linux-arm64   (Linux ARM64)
+# Other platforms: build from source (see below)
 ```
 
 Or build from source (requires Go 1.26+):
@@ -243,8 +242,7 @@ Examples:
 
 ## Client compatibility
 
-Tested with walsync v0.8.0 — all clients read incremental WAL correctly with **persistent readonly connections** (natural app pattern).
-
+Tested with walsync v1.1.0 — all clients read replica data correctly with **persistent readonly connections** (natural app pattern). No SIGBUS, no silent corruption. See [compat/](compat/) for automated test suite (8 tests, runs in CI).
 | Client | Language | Engine | Status |
 |--------|----------|--------|:------:|
 | sqlite3 CLI | C | C API | ✅ |
@@ -261,10 +259,8 @@ Tested with walsync v0.8.0 — all clients read incremental WAL correctly with *
 
 **Pattern for replica reads:**
 ```js
-// Natural pattern — persistent readonly connection.
-// walsync corrupts -shm after each WAL ship (same inode).
-// SQLite detects invalid checksum → rebuilds from WAL → updates -shm in place.
-// Persistent connection sees update via mmap shared memory.
+// Natural pattern — persistent readonly connection, no workarounds needed.
+// v1.1.0 uses in-place -shm invalidation (preserves mmap) + WAL salt validation.
 const db = new Database(replicaPath, { readonly: true });
 app.get('/api/users', (req, res) => {
   res.json(db.prepare('SELECT * FROM users').all());
@@ -280,7 +276,7 @@ Use `readonly: true` to prevent checkpoint on close (WAL preserved for next incr
 - **Eventual consistency** — Sync delay ~100ms median (measured: 33-210ms, 2 Singapore VPS, ~20ms RTT)
 - **No auth (by design)** — HTTP endpoints are unauthenticated. Security is handled at network layer (firewall/VPN), not application layer. Zero overhead.
 - **No WAL frame-level shipping** — Ships WAL file chunks, not individual frames. Checkpoint triggers full snapshot.
-- **Replica reads use readonly connections** — walsync corrupts `-shm` after each WAL ship (same inode) so SQLite rebuilds the WAL index in place. Persistent readonly connections see new frames via mmap. Use `readonly: true` to prevent checkpoint on close (WAL preserved). See [client compatibility](#client-compatibility) and [app patterns](docs/app-patterns.md).
+- **Replica reads use readonly connections** — v1.1.0 uses in-place `-shm` invalidation (preserves mmap, no SIGBUS) + WAL salt validation (no silent corruption on checkpoint). Use `readonly: true` to prevent checkpoint on close (WAL preserved). See [client compatibility](#client-compatibility) and [compat/](compat/) for automated test suite.
 
 ### Roadmap
 
@@ -293,6 +289,7 @@ Use `readonly: true` to prevent checkpoint on close (WAL preserved for next incr
 - [x] ~~WAL visibility fix (-shm removal)~~ — Shipped in v0.7.0 (incremental WAL now visible to all SQLite clients)
 - [x] ~~WAL visibility fix (-shm corruption)~~ — Shipped in v0.8.0 (persistent readonly connections now see incremental WAL via mmap)
 - [x] ~~Graceful shutdown + production hardening~~ — Shipped in v1.0.0 (SIGTERM/SIGINT, production checklist, snapshot auto-reconnect, WAL growth docs)
+- [x] ~~SIGBUS fix + salt validation~~ — Shipped in v1.1.0 (in-place `-shm` invalidation prevents SIGBUS in bun:sqlite; WAL salt validation prevents silent corruption on checkpoint/CLI access; cross-library compat test suite in CI)
 
 ## Benchmark
 
@@ -359,6 +356,7 @@ Before deploying walsync to production, verify each item below. Skipping any of 
 - [ ] **Use `readonly: true` connections** — Closing a readwrite connection triggers checkpoint → WAL truncated → next incremental WAL ship writes to empty WAL at wrong offset → **WAL invalid**. Readonly connections do NOT checkpoint on close.
 - [ ] **Handle stale reads after snapshot** — When primary checkpoints, walsync ships a full snapshot (atomic DB file replace). Your app's persistent connection now points to the old (deleted) DB file. **Reopen connections after snapshot.** See [app patterns — snapshot handling](docs/app-patterns.md#snapshot-handling).
 - [ ] **Do NOT write to replica DB** — Replica is read-only. Writes will conflict with walsync's WAL writes and cause corruption.
+- [ ] **v1.1.0+ required for salt mismatch recovery** — If someone runs `sqlite3` CLI on the replica DB (readwrite), it checkpoints and recreates the WAL with a different salt. v1.1.0 detects the salt mismatch and ships a fresh snapshot automatically. v1.0.0 silently corrupts data in this scenario.
 
 ### walsync process
 
